@@ -1,0 +1,63 @@
+{
+  "role": "Backend Engineer",
+  "questions": [
+    {
+      "prompt": "How would you design a rate limiter for an API?",
+      "expected_answer": "Clarify the limit dimension (per user/IP/key) and window, choose an algorithm such as token bucket for smooth bursts, keep counters in a shared low-latency store with atomic increments for distributed correctness, decide fail-open vs fail-closed on storage outage, and add metrics for rejects and hot keys.",
+      "key_points": [
+        "Clarifies limit dimension and time window",
+        "Names a concrete algorithm (token bucket / sliding window)",
+        "Distributed correctness: shared store with atomic operations",
+        "Handles failure mode (fail-open vs fail-closed)",
+        "Observability / abuse or hot-key handling"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "prompt": "How do you approach database schema design?",
+      "expected_answer": "Start from access patterns and invariants, model entities and relationships, add constraints and indexes to enforce and serve queries, normalize for correctness and denormalize deliberately only for measured read paths, and plan safe reversible migrations with backfills.",
+      "key_points": [
+        "Starts from access patterns / queries, not tables in isolation",
+        "Normalizes for correctness",
+        "Uses constraints, foreign keys, and indexes intentionally",
+        "Denormalizes deliberately for known read paths",
+        "Plans safe, reversible migrations"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "prompt": "Explain the difference between optimistic and pessimistic locking, and when you'd use each.",
+      "expected_answer": "Pessimistic locking takes a lock before modifying (e.g. SELECT FOR UPDATE), blocking others; good under high contention or when conflicts are costly. Optimistic locking checks a version/timestamp at write time and retries on conflict; good under low contention and high read volume because it avoids holding locks.",
+      "key_points": [
+        "Pessimistic = lock before write (blocks others)",
+        "Optimistic = version/timestamp check at write, retry on conflict",
+        "Pessimistic suits high contention",
+        "Optimistic suits low contention / high concurrency reads"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "prompt": "What is idempotency and how would you make a payment API endpoint idempotent?",
+      "expected_answer": "Idempotency means repeating the same request has the same effect as doing it once. For a payment endpoint, accept a client-supplied idempotency key, store it uniquely with the result, and on a retry with the same key return the stored result instead of charging again — typically enforced with a unique constraint and an insert-or-return.",
+      "key_points": [
+        "Defines idempotency (same effect on repeat)",
+        "Uses a client-supplied idempotency key",
+        "Persists the key uniquely with the outcome",
+        "Returns stored result on retry instead of re-executing"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "prompt": "How would you debug a production service that suddenly has high latency?",
+      "expected_answer": "Start from signals: check dashboards and traces to localize where latency is added, look at recent deploys and config changes, inspect downstream dependencies (DB, cache, external calls) for saturation or slow queries, check resource limits (CPU, memory, connections), and form a hypothesis before changing anything; mitigate (rollback, scale, shed load) then fix root cause.",
+      "key_points": [
+        "Uses metrics/traces/logs to localize the bottleneck",
+        "Checks recent deploys / changes",
+        "Inspects downstream dependencies (DB, cache, external)",
+        "Considers resource saturation (CPU, connections, memory)",
+        "Mitigates then fixes root cause, not just symptoms"
+      ],
+      "difficulty": "medium"
+    }
+  ]
+}

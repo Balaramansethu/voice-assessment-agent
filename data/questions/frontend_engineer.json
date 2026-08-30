@@ -1,0 +1,64 @@
+{
+  "role": "Frontend Engineer",
+  "questions": [
+    {
+      "prompt": "Explain the browser rendering critical path and how you'd optimize initial page load.",
+      "expected_answer": "The critical path is HTML parse to DOM, CSS to CSSOM, combined into the render tree, then layout and paint. To optimize initial load: minimize and defer render-blocking CSS/JS, inline critical CSS, lazy-load below-the-fold assets, compress and right-size images, use code-splitting, and leverage caching and a CDN.",
+      "key_points": [
+        "Describes DOM + CSSOM -> render tree -> layout -> paint",
+        "Identifies render-blocking resources (CSS/JS)",
+        "Defers/splits/lazy-loads non-critical assets",
+        "Optimizes images and uses compression",
+        "Uses caching / CDN"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "prompt": "What causes unnecessary re-renders in React and how do you prevent them?",
+      "expected_answer": "Re-renders happen when state or props change or the parent re-renders. Prevent unnecessary ones by memoizing components (React.memo), memoizing values and callbacks (useMemo/useCallback), keeping state local and lifting only when needed, using stable keys, and avoiding creating new object/function references inline that break memoization.",
+      "key_points": [
+        "State/props change or parent re-render triggers re-render",
+        "React.memo for components",
+        "useMemo / useCallback for stable values and callbacks",
+        "Avoids new inline object/function references",
+        "Keeps state as local as possible"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "prompt": "How do you make a web application accessible (a11y)?",
+      "expected_answer": "Use semantic HTML, provide text alternatives for images, ensure keyboard navigability and visible focus, use ARIA only when semantics are insufficient, maintain sufficient color contrast, label form controls, and test with screen readers and automated tools like axe.",
+      "key_points": [
+        "Semantic HTML first",
+        "Keyboard navigation and focus management",
+        "Alt text / labels for images and form controls",
+        "Sufficient color contrast",
+        "ARIA used appropriately; tested with screen readers/tools"
+      ],
+      "difficulty": "medium"
+    },
+    {
+      "prompt": "Explain the difference between debouncing and throttling, with a use case for each.",
+      "expected_answer": "Debouncing delays running a function until a pause in events (e.g. wait until the user stops typing before firing a search). Throttling runs a function at most once per interval regardless of event frequency (e.g. handling scroll or resize events). Debounce collapses bursts to the trailing call; throttle enforces a steady rate.",
+      "key_points": [
+        "Debounce = run after events stop for a delay",
+        "Throttle = run at most once per interval",
+        "Debounce use case (e.g. search-as-you-type)",
+        "Throttle use case (e.g. scroll/resize)"
+      ],
+      "difficulty": "easy"
+    },
+    {
+      "prompt": "How would you manage shared state in a large single-page application?",
+      "expected_answer": "Distinguish server state from client state: use a data-fetching/caching library (React Query/SWR) for server state, and a lightweight store (Context, Zustand, Redux) for genuinely global client state. Keep most state local, colocate it with where it's used, normalize shared data, and avoid a single giant global store for everything.",
+      "key_points": [
+        "Separates server state from client/UI state",
+        "Uses a caching/data-fetching layer for server state",
+        "Uses a store or context for truly global state",
+        "Keeps state local/colocated where possible",
+        "Avoids over-centralizing all state"
+      ],
+      "difficulty": "medium"
+    }
+  ]
+}
