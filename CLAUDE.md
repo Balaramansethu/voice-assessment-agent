@@ -2,6 +2,21 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Use the project subagents
+
+This repo defines dedicated subagents in `.claude/agents/`. Prefer them for their domain:
+
+- **python-dev** — implement features, bug fixes, and refactors here (endpoints, services, agent
+  tools, RAG, tests). Enforces the architecture invariants + professional Python standards.
+- **code-reviewer** — review and tune changed code (correctness, simplicity, types, best practice).
+- **sec-audit** — security audit (leaked secrets, auth gaps, injection, exposed surfaces) before
+  pushing or deploying.
+- **deployer** — deploy to the OCI production box (Twilio phone) and verify.
+
+Host-specific and sensitive operational details (box IP, SSH, key rotation, troubleshooting)
+live in the gitignored **`RUNBOOK.local.md`**. Common commands are in the **`Makefile`**
+(`make help`).
+
 ## What this is
 
 Zero-paid POC of an inbound interview voice agent. A candidate who missed an outbound

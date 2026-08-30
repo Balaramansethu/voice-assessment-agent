@@ -9,3 +9,8 @@ venv/
 
 # local config (copy from app/config.example.py; secrets come from .env)
 app/config.py
+
+# private personal runbook (host/SSH/secret-handling specifics)
+RUNBOOK.local.md
+# local Claude Code settings (keep project agents/ tracked)
+.claude/settings.local.json
