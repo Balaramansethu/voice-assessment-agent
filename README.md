@@ -135,10 +135,12 @@ Dockerfile / Dockerfile.agent   core API image / heavier voice-agent image
 
 ## Run locally (browser / WebRTC)
 
-Prereqs: Docker (Colima works: `colima start`). Copy `.env.example` → `.env` and set at least
-`GROQ_API_KEY`.
+Prereqs: Docker (Colima works: `colima start`). Create your local config + env from the
+templates, then set at least `GROQ_API_KEY` in `.env`:
 
 ```bash
+cp app/config.example.py app/config.py        # gitignored local settings module
+cp .env.example .env                          # gitignored secrets (fill GROQ_API_KEY, ...)
 docker compose up -d                          # postgres + api + agent
 docker compose exec api python -m scripts.seed_questions   # seed assessment banks
 docker compose exec api python -m scripts.ingest_kb        # seed RAG knowledge base
@@ -187,7 +189,20 @@ Caller → Twilio number → HTTPS webhook (Caddy :443) → agent TwiML
 
 ---
 
-## Configuration (`.env`)
+## Configuration
+
+**`app/config.py` is gitignored** — it is the local settings module and is intentionally
+kept out of version control so secrets never get committed. After cloning, create it from the
+tracked template:
+
+```bash
+cp app/config.example.py app/config.py
+```
+
+`config.py` ships with empty/placeholder defaults; the real secret values are supplied at
+runtime from **`.env`** (also gitignored). You normally only edit `.env`.
+
+### `.env`
 
 Never commit `.env`. Key settings (see `.env.example`):
 

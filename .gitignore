@@ -6,3 +6,6 @@ __pycache__/
 venv/
 *.egg-info/
 .DS_Store
+
+# local config (copy from app/config.example.py; secrets come from .env)
+app/config.py
