@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Inbound Interview Agent — Control Panel</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 780px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+    h1 { font-size: 1.4rem; } h2 { font-size: 1.05rem; margin-top: 1.8rem; }
+    button { padding: .5rem .8rem; margin: .2rem; border: 1px solid #ccc; border-radius: 6px; background: #f7f7f7; cursor: pointer; }
+    button:hover { background: #eee; }
+    pre { background: #0f172a; color: #e2e8f0; padding: 1rem; border-radius: 8px; overflow: auto; font-size: .85rem; }
+    .row { display: flex; flex-wrap: wrap; gap: .3rem; align-items: center; }
+    input { padding: .4rem; border: 1px solid #ccc; border-radius: 6px; }
+    .note { background: #fef3c7; padding: .6rem .8rem; border-radius: 6px; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <h1>Inbound Interview Agent — Control Panel</h1>
+  <p class="note">Phase-1 REST demo. Voice (WebRTC ↔ Pipecat) is wired separately — see README.
+  This panel drives the same orchestrator the voice agent calls.</p>
+
+  <h2>1. Seed a scenario</h2>
+  <div class="row">
+    <button onclick="scenario('no-answer')">no-answer</button>
+    <button onclick="scenario('voicemail')">voicemail</button>
+    <button onclick="scenario('interrupted')">interrupted</button>
+    <button onclick="scenario('completed')">completed</button>
+    <button onclick="scenario('unknown-caller')">unknown-caller</button>
+  </div>
+
+  <h2>2. Simulate the callback (resolve caller → open interview)</h2>
+  <div class="row">
+    <input id="from" value="+919000000001" />
+    <button onclick="inbound()">Inbound call</button>
+  </div>
+
+  <h2>3. Candidate intent → orchestrator decides</h2>
+  <div class="row">
+    <input id="iid" placeholder="interview_id" style="width:120px" />
+    <button onclick="action('START_INTERVIEW')">START</button>
+    <button onclick="action('CONTINUE_INTERVIEW')">CONTINUE</button>
+    <button onclick="action('RESCHEDULE')">RESCHEDULE</button>
+    <button onclick="action('TALK_TO_HUMAN')">TALK_TO_HUMAN</button>
+  </div>
+
+  <h2>Response</h2>
+  <pre id="out">—</pre>
+
+<script>
+const out = document.getElementById('out');
+const show = (d) => out.textContent = JSON.stringify(d, null, 2);
+const post = (url, body) => fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body||{})}).then(r=>r.json());
+
+async function scenario(kind){ const d = await post('/scenarios/'+kind, {}); document.getElementById('iid').value = d.interview.id; document.getElementById('from').value = d.candidate.phone; show(d); }
+async function inbound(){ const from = document.getElementById('from').value; const d = await post('/calls/inbound', {provider_call_id:'WEB'+Date.now(), from_number:from, transport:'webrtc'}); if(d.interview) document.getElementById('iid').value = d.interview.id; show(d); }
+async function action(intent){ const iid = parseInt(document.getElementById('iid').value); const d = await post('/interviews/action', {interview_id:iid, intent}); show(d); }
+</script>
+</body>
+</html>
