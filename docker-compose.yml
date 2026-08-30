@@ -1,0 +1,61 @@
+# Zero-paid local stack. STT + LLM run on Groq (HTTP), so the only local
+# containers are Postgres and the app. No Redis, no Kafka, no LiveKit, no broker.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: interview
+      POSTGRES_PASSWORD: interview
+      POSTGRES_DB: interview
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U interview"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://interview:interview@postgres:5432/interview
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./app:/app/app
+      - ./web:/app/web
+      - ./tests:/app/tests
+      - ./scripts:/app/scripts
+      - ./data:/app/data
+      - fastembed_cache:/root/.cache/fastembed
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Pipecat voice agent (realtime Groq STT/LLM + Kokoro TTS over WebRTC).
+  # Serves the browser UI on :7860. Calls the api service for all state changes.
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    image: voice_agent-agent:latest
+    env_file: .env
+    environment:
+      API_BASE: http://api:8000
+    volumes:
+      - ./app:/app/app                 # live-edit the bot without a rebuild
+      - kokoro_models:/root/.cache     # cache the downloaded Kokoro model
+    ports:
+      - "7860:7860"
+    depends_on:
+      - postgres
+      - api
+
+volumes:
+  pgdata:
+  kokoro_models:
+  fastembed_cache:

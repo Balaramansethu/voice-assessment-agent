@@ -1,0 +1,36 @@
+[project]
+name = "inbound-interview-agent"
+version = "0.1.0"
+description = "Zero-paid, open-source-heavy inbound interview voice agent"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+    "python-dotenv>=1.0",
+    "httpx>=0.27",
+    "phonenumbers>=8.13",
+]
+
+[project.optional-dependencies]
+# Realtime voice layer. Heavier deps; installed in the `agent` container.
+voice = [
+    "pipecat-ai[groq,webrtc,silero]>=0.0.60",
+    "kokoro>=0.7",
+    "soundfile>=0.12",
+    "numpy>=1.26",
+]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
