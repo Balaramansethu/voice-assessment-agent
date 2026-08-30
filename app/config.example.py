@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     twilio_account_sid: str = ""
     twilio_auth_token: str = ""
     twilio_phone_number: str = ""
+    public_host: str = ""           # public domain (for Twilio signature validation)
 
     # interview config
     interview_expiry_hours: int = 72

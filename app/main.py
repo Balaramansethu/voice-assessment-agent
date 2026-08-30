@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.api import (
     assessment, calls, candidates, health, interviews, observability, rag, scenarios,
+    telephony,
 )
 from app.config import settings
 from app.db.session import init_db
@@ -57,6 +58,7 @@ app.include_router(calls.router)
 app.include_router(rag.router)
 app.include_router(observability.router)
 app.include_router(assessment.router)
+app.include_router(telephony.router)
 
 if WEB_DIR.exists():
     app.mount("/static", StaticFiles(directory=WEB_DIR), name="static")

@@ -41,6 +41,8 @@ services:
     environment:
       API_BASE: http://api:8000
     # Twilio telephony mode; -x is the public host used to build the WSS stream URL.
+    # The public webhook is guarded by Twilio signature validation (api service),
+    # which is the primary access control for the phone path.
     command: ["python", "-m", "app.agent.pipeline", "-t", "twilio",
               "-x", "${PUBLIC_HOST}", "--host", "0.0.0.0"]
     volumes:
@@ -62,6 +64,7 @@ services:
       PUBLIC_HOST: ${PUBLIC_HOST}
     depends_on:
       - agent
+      - api
     restart: unless-stopped
 
 volumes:

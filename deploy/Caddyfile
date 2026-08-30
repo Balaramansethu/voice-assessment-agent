@@ -1,5 +1,14 @@
-# Automatic HTTPS (Let's Encrypt) for the public host, reverse-proxied to the
-# Pipecat agent. Caddy transparently upgrades the Twilio Media Stream to WSS.
+# Automatic HTTPS (Let's Encrypt) for the public host.
+#   /ws*  → agent's media WebSocket (protected by the runner's one-time tokens)
+#   else  → the Twilio webhook guard on the api service, which validates the
+#           X-Twilio-Signature and only forwards genuine Twilio calls to the agent.
 {$PUBLIC_HOST} {
-	reverse_proxy agent:7860
+	@ws path /ws*
+	handle @ws {
+		reverse_proxy agent:7860
+	}
+	handle {
+		rewrite * /twilio/voice
+		reverse_proxy api:8000
+	}
 }

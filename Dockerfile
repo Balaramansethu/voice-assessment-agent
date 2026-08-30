@@ -11,7 +11,7 @@ RUN pip install --no-cache-dir \
         "fastapi>=0.115" "uvicorn[standard]>=0.30" \
         "pydantic>=2.7" "pydantic-settings>=2.3" \
         "sqlalchemy>=2.0" "psycopg[binary]>=3.1" \
-        "python-dotenv>=1.0" "httpx>=0.27" "phonenumbers>=8.13" \
+        "python-dotenv>=1.0" "python-multipart>=0.0.9" "httpx>=0.27" "phonenumbers>=8.13" \
         "pytest>=8.2"
 
 # RAG layer: pgvector ORM type + local ONNX embeddings (CPU, no GPU).
