@@ -1,0 +1,5 @@
+# Automatic HTTPS (Let's Encrypt) for the public host, reverse-proxied to the
+# Pipecat agent. Caddy transparently upgrades the Twilio Media Stream to WSS.
+{$PUBLIC_HOST} {
+	reverse_proxy agent:7860
+}
