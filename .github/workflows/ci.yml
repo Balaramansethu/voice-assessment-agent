@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Real Postgres with pgvector — the integration + RAG suites need it.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: interview
+          POSTGRES_PASSWORD: interview
+          POSTGRES_DB: interview
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U interview"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      # Point the app at the CI Postgres service (tests read this via settings).
+      DATABASE_URL: postgresql+psycopg://interview:interview@localhost:5432/interview
+      # Tracing off in CI (no LangSmith key needed; no secrets required at all).
+      LANGSMITH_TRACING: "false"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+
+      - name: Create local config from template
+        run: cp app/config.example.py app/config.py
+
+      - name: Run tests
+        run: pytest -q
