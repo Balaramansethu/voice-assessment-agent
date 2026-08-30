@@ -1,5 +1,8 @@
 # Inbound Interview / Assessment Voice Agent
 
+[![CI](https://github.com/Balaramansethu/voice-assessment-agent/actions/workflows/ci.yml/badge.svg)](https://github.com/Balaramansethu/voice-assessment-agent/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 A production-shaped, **open-source-first** voice AI agent that conducts spoken technical
 screening assessments over **the phone** (Twilio) or a **browser** (WebRTC). A caller states
 the role they're interviewing for; the agent asks that role's pre-seeded questions one at a
