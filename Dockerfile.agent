@@ -10,18 +10,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libsndfile1 ffmpeg espeak-ng \
     && rm -rf /var/lib/apt/lists/*
 
-# Heavy layer — keep this command byte-identical so the Docker cache is reused
-# across rebuilds (it pulls PyTorch via silero/kokoro; ~minutes to download).
+# Heavy layer — PINNED to the versions proven in production. Unpinned `>=` let
+# pip pull a newer Pipecat/OpenAI on the box than local, which broke the Twilio
+# telephony path (add_wav_header / reasoning_format). Pin so local == prod.
 RUN pip install --no-cache-dir \
         "httpx>=0.27" "pydantic-settings>=2.3" "python-dotenv>=1.0" \
-        "pipecat-ai[groq,webrtc,silero]" \
+        "pipecat-ai[groq,webrtc,silero]==1.8.1" "openai==2.54.0" \
         "kokoro>=0.7" "soundfile>=0.12" "numpy>=1.26"
 
 # Light layer — runner web server + SmallWebRTC prebuilt UI + Kokoro ONNX runtime.
 # Separate from the heavy layer so these edits don't re-pull torch.
 RUN pip install --no-cache-dir \
         "fastapi>=0.115" "uvicorn[standard]>=0.30" "pydantic>=2.7" \
-        "pipecat-ai-prebuilt" "kokoro-onnx>=0.4"
+        "pipecat-ai-prebuilt" "kokoro-onnx==0.6.1"
 
 COPY app ./app
 COPY web ./web

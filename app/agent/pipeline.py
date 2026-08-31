@@ -37,6 +37,7 @@ from pipecat.services.groq.stt import GroqSTTService
 from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.base_transport import TransportParams
+from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 
 from app.agent import prompts
 from app.agent import tools
@@ -105,10 +106,11 @@ def _transport_params() -> dict:
             audio_in_filter=GainAudioFilter(gain=8.0),
             audio_out_enabled=True,
         ),
-        # Phone: Twilio Media Streams deliver 8kHz mu-law at normal telephone level,
-        # so no gain boost is needed (it would clip). The runner wires the Twilio
-        # serializer; this just enables audio in/out.
-        "twilio": lambda: TransportParams(
+        # Phone: Twilio needs FastAPIWebsocketParams (the runner sets add_wav_header
+        # and the Twilio serializer on it — the base TransportParams lacks those
+        # fields, which crashes the telephony bot). 8kHz mu-law at telephone level,
+        # so no gain boost.
+        "twilio": lambda: FastAPIWebsocketParams(
             audio_in_enabled=True,
             audio_out_enabled=True,
         ),
@@ -129,8 +131,10 @@ async def bot(runner_args: RunnerArguments) -> None:
             model=os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-120b"),
             # gpt-oss is a reasoning model; without this its chain-of-thought comes
             # back in the `reasoning` field and Pipecat speaks it aloud. "hidden"
-            # drops reasoning from the response so only the final answer is spoken.
-            extra={"reasoning_format": "hidden", "reasoning_effort": "low"},
+            # drops reasoning so only the final answer is spoken. Pipecat spreads
+            # `extra` as top-level create() kwargs, so Groq-specific params must go
+            # inside `extra_body` (the OpenAI SDK forwards it to Groq).
+            extra={"extra_body": {"reasoning_format": "hidden", "reasoning_effort": "low"}},
         ),
     )
     tts = KokoroTTSService(
@@ -139,10 +143,13 @@ async def bot(runner_args: RunnerArguments) -> None:
 
     # VAD must be a pipeline processor in Pipecat 1.7 (NOT a TransportParams field).
     # It emits UserStarted/StoppedSpeaking, which drives the segmented Groq STT.
+    # stop_secs is generous (1.5s) so a natural pause mid-answer doesn't end the
+    # turn — this prevents answers being truncated or landing on the wrong question,
+    # which we saw on phone calls. Confidence 0.5 reduces false triggers on line noise.
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
-            params=VADParams(confidence=0.35, start_secs=0.2,
-                             stop_secs=0.8, min_volume=0.0),
+            params=VADParams(confidence=0.5, start_secs=0.2,
+                             stop_secs=1.5, min_volume=0.0),
         ),
     )
 

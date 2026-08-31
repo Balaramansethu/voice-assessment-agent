@@ -21,7 +21,7 @@ class Settings(BaseSettings):
     llm_provider: str = "groq"      # groq | ollama
     groq_api_key: str = ""
     groq_llm_model: str = "openai/gpt-oss-120b"
-    groq_stt_model: str = "whisper-large-v3-turbo"
+    groq_stt_model: str = "whisper-large-v3"
 
     # TTS — local, no key
     tts_provider: str = "kokoro"    # kokoro | piper
