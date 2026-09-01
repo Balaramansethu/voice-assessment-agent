@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -134,8 +135,28 @@ def grade_answer(session: Session, *, session_id: int, transcript: str) -> dict:
             "progress": f"{next_idx}/{len(questions)}"}
 
 
+def _rating_band(average_score: float | None) -> str | None:
+    """Map an average per-answer score (0..1) to a recruiter-facing rating band.
+    Thresholds: strong >= 0.7, mixed 0.4..0.69, weak < 0.4. None if unscored."""
+    if average_score is None:
+        return None
+    if average_score >= 0.7:
+        return "strong"
+    if average_score >= 0.4:
+        return "mixed"
+    return "weak"
+
+
 def _summary(session: Session, s: AssessmentSession, questions: list,
              just_graded: bool = False) -> dict:
+    """Aggregate the persisted per-answer verdicts/scores into the overall result.
+
+    This is the single scoring path: the numbers returned here are exactly what we
+    stamp onto the session on completion. `just_graded=True` marks the last question
+    as just graded, so we persist the aggregate rating onto the session row here (the
+    clean completion spot). Read-only callers (the summary endpoint) leave the row
+    untouched but see the same numbers, since they derive from assessment_answer.
+    """
     rows = session.scalars(
         select(AssessmentAnswer).where(AssessmentAnswer.session_id == s.id)
         .order_by(AssessmentAnswer.position)
@@ -143,11 +164,27 @@ def _summary(session: Session, s: AssessmentSession, questions: list,
     correct = sum(1 for r in rows if r.verdict == "correct")
     partial = sum(1 for r in rows if r.verdict == "partial")
     avg = round(sum((r.score or 0) for r in rows) / len(rows), 2) if rows else None
+    rating = _rating_band(avg)
+
+    # Persist the aggregate exactly once, when the final answer has just been graded.
+    # Grading is SILENT: these values are for the recruiter and never returned to the
+    # agent to speak. Idempotent — re-stamping the same derived numbers is harmless.
+    if just_graded and s.completed_at is None:
+        s.total_questions = len(questions)
+        s.answered = len(rows)
+        s.correct_count = correct
+        s.average_score = avg
+        s.rating = rating
+        s.completed_at = datetime.now(timezone.utc)
+        session.flush()
+
     return {
         "ok": True, "done": True, "role": s.role,
+        "candidate_name": s.candidate_name,
         "total": len(questions), "answered": len(rows),
         "correct": correct, "partial": partial,
         "incorrect": len(rows) - correct - partial, "average_score": avg,
+        "rating": rating,
         "breakdown": [{"position": r.position, "verdict": r.verdict, "score": r.score,
                        "missing": r.missing} for r in rows],
     }

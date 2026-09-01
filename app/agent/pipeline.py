@@ -21,6 +21,7 @@ import time
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import Frame, LLMRunFrame, TextFrame
@@ -28,8 +29,24 @@ from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
-from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
 from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.turns.user_turn_strategies import (
+    UserTurnStrategies,
+    default_user_turn_start_strategies,
+)
+from pipecat.turns.user_stop.base_user_turn_stop_strategy import (
+    BaseUserTurnStopStrategy,
+)
+from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
+    SpeechTimeoutUserTurnStopStrategy,
+)
+from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
+    TurnAnalyzerUserTurnStopStrategy,
+)
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
@@ -50,7 +67,8 @@ START_ASSESSMENT_SCHEMA = FunctionSchema(
                 "once they tell you which role they're interviewing for.",
     properties={
         "role": {"type": "string", "description": "The role, e.g. 'Backend Engineer'."},
-        "candidate_name": {"type": "string", "description": "Their name, if they gave it."},
+        "candidate_name": {"type": "string", "description": "The caller's name. Always pass it "
+                           "if they gave one; omit only if they truly declined to say."},
     },
     required=["role"],
 )
@@ -161,12 +179,29 @@ async def bot(runner_args: RunnerArguments) -> None:
         voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-thalia-en"),
     )
 
-    # Silero VAD is the SINGLE turn-taking authority (Deepgram endpointing is off).
-    # It emits the VADUserStarted/StoppedSpeaking frames the context aggregator turns
-    # into user turns and interruptions. Tuning:
-    #   stop_secs=2.0 — a longer trailing-silence window so a natural mid-answer pause
-    #     ("The washing machine is working … twenty four by seven") stays ONE turn and
-    #     one submit_answer call, instead of splitting onto the wrong question.
+    # Turn-taking is now a TWO-SIGNAL system, and the two have distinct jobs:
+    #
+    #   START / interruptions  → Silero VAD (VADUserTurnStartStrategy, below).
+    #     VAD still detects speech ONSET and drives barge-in. Nothing about start
+    #     behavior changes.
+    #   STOP / end-of-turn      → Smart Turn v3 (TurnAnalyzerUserTurnStopStrategy).
+    #     A small ONNX prosody model predicts whether the caller has genuinely
+    #     finished their thought, rather than timing a fixed silence. It decides
+    #     FAST when confident (a falling, complete-sounding "…twenty four by seven.")
+    #     and holds the turn open through a mid-answer pause that only SOUNDS
+    #     unfinished ("The washing machine is working …<thinking>… all week"). This
+    #     replaces the old crude stop_secs=2.0 fixed-silence endpoint that both cut
+    #     people off mid-pause AND always waited the full 2s when they were done.
+    #
+    # VAD stop_secs is therefore no longer the primary end-of-turn signal. We return
+    # it to Pipecat's recommended 0.2s (VAD_STOP_SECS) so VAD reports "silence began"
+    # promptly and Smart Turn can run its inference on the pause immediately; the
+    # framework warns if this drifts from 0.2 because the STT p99 safety-net budget is
+    # calibrated to it. The GENEROUS backstop that guarantees a turn always ends even
+    # if the model never says COMPLETE lives inside the analyzer itself
+    # (SmartTurnParams.stop_secs defaults to 3.0s of hard silence → forced COMPLETE),
+    # so Smart Turn owns both the fast decision and the safety net; VAD just detects
+    # speech edges.
     #   confidence=0.6 — Silero's neural speech/non-speech score is the real gate and
     #     rejects breath/background noise on its own. min_volume=0.0 disables the raw
     #     amplitude gate: browser WebRTC audio arrives quiet (~3% full-scale) and the
@@ -177,8 +212,43 @@ async def bot(runner_args: RunnerArguments) -> None:
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
             params=VADParams(confidence=0.6, start_secs=0.2,
-                             stop_secs=2.0, min_volume=0.0),
+                             stop_secs=0.2, min_volume=0.0),
         ),
+    )
+
+    # End-of-turn STOP strategy. START is always VAD + transcription (below); only
+    # the stop signal is switchable via TURN_DETECTION.
+    #
+    #   smart_turn (default) — Smart Turn v3. The 8.6MB ONNX is baked into the agent
+    #     image (bundled with Pipecat), so passing no model path loads it from disk
+    #     with no download.
+    #   vad — the old fixed-silence endpointer (SpeechTimeoutUserTurnStopStrategy),
+    #     with NO ML. For offline / low-CPU boxes.
+    #
+    # We must always build an explicit stop strategy for the `vad` case: leaving it
+    # unset (passing None) does NOT disable ML — UserTurnStrategies.__post_init__
+    # backfills the framework default, which is itself Smart Turn v3. So `vad` has to
+    # name SpeechTimeoutUserTurnStopStrategy to genuinely opt out of the model.
+    turn_detection = os.getenv("TURN_DETECTION", "smart_turn").strip().lower()
+    smart_turn_cpus = int(os.getenv("SMART_TURN_CPU_COUNT", "1"))
+    if turn_detection == "smart_turn":
+        # The stop strategy is self-driving: it consumes the InputAudioRawFrame /
+        # VAD / transcription frames already flowing through the user aggregator,
+        # sets its own sample rate on setup(), and syncs the analyzer's pre-speech
+        # buffer to VAD start_secs — no manual audio plumbing needed. wait_for_transcript
+        # keeps us on the cascade (STT) path: fire on COMPLETE *and* a finalized
+        # transcript, so we never cut a turn before Deepgram has the words.
+        stop_strategy: BaseUserTurnStopStrategy = TurnAnalyzerUserTurnStopStrategy(
+            turn_analyzer=LocalSmartTurnAnalyzerV3(cpu_count=smart_turn_cpus),
+            wait_for_transcript=True,
+        )
+    else:
+        # Fixed-silence fallback: end the turn a short window after VAD reports
+        # silence, once a final transcript has landed. No prosody model.
+        stop_strategy = SpeechTimeoutUserTurnStopStrategy(wait_for_transcript=True)
+    user_turn_strategies = UserTurnStrategies(
+        start=default_user_turn_start_strategies(),  # keep VAD + transcription START
+        stop=[stop_strategy],
     )
 
     # Per-connection binding, set once the assessment starts.
@@ -246,7 +316,15 @@ async def bot(runner_args: RunnerArguments) -> None:
             START_ASSESSMENT_SCHEMA, SUBMIT_ANSWER_SCHEMA, KB_ANSWER_SCHEMA,
         ]),
     )
-    user_agg, assistant_agg = LLMContextAggregatorPair(context)
+    # user_turn_strategies is the hook Pipecat 1.8 exposes for pluggable turn
+    # detection: LLMContextAggregatorPair → LLMUserAggregator → UserTurnController
+    # consumes it. We always pass an explicit strategy set (built above) so cpu_count
+    # and the smart_turn/vad switch are ours to control and the wiring is visible in
+    # this file — the framework default would silently be Smart Turn v3 either way.
+    user_agg, assistant_agg = LLMContextAggregatorPair(
+        context,
+        user_params=LLMUserAggregatorParams(user_turn_strategies=user_turn_strategies),
+    )
 
     pipeline = Pipeline([
         transport.input(),
@@ -276,8 +354,9 @@ async def bot(runner_args: RunnerArguments) -> None:
             {"role": "system", "content": prompts.SYSTEM_AGENT},
             {"role": "user", "content":
              "The call just connected. Greet me warmly, say you're the automated screening "
-             "assistant, and ask which role I'm interviewing for (for example Backend Engineer "
-             "or Frontend Engineer). Do NOT call any function yet — wait for me to name a role."},
+             "assistant, and in one short line ask for my NAME and which role I'm interviewing "
+             "for (for example Backend Engineer or Frontend Engineer). Do NOT call any function "
+             "yet — wait for me to give my name and role."},
         ])
         await task.queue_frames([LLMRunFrame()])
 

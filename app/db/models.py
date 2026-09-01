@@ -223,13 +223,25 @@ class RoleQuestion(Base):
 
 
 class AssessmentSession(Base):
-    """A lightweight quiz run for one role. No START/RESUME/COMPLETE lifecycle."""
+    """A lightweight quiz run for one role. No START/RESUME/COMPLETE lifecycle.
+
+    The final result (aggregate rating) is derived from the persisted
+    `assessment_answer` verdicts/scores and stamped here on completion — the
+    recruiter-facing record. Never spoken to the candidate (silent grading)."""
     __tablename__ = "assessment_session"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     role: Mapped[str] = mapped_column(String(200), index=True)
     candidate_name: Mapped[str | None] = mapped_column(String(200))
     call_id: Mapped[int | None] = mapped_column(ForeignKey("call.id"))
+    # Final aggregate result, written once when the last question is graded.
+    # NULL until completion; derived from assessment_answer (single source of truth).
+    total_questions: Mapped[int | None] = mapped_column(Integer)
+    answered: Mapped[int | None] = mapped_column(Integer)
+    correct_count: Mapped[int | None] = mapped_column(Integer)
+    average_score: Mapped[float | None] = mapped_column(Float)   # 0..1
+    rating: Mapped[str | None] = mapped_column(String(20))       # strong | mixed | weak
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _now()
 
 

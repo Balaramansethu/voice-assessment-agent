@@ -36,6 +36,14 @@ class Settings(BaseSettings):
     deepgram_stt_model: str = "nova-3"          # Nova-3 general (better accuracy, keyterm boosting)
     deepgram_tts_voice: str = "aura-2-thalia-en"  # natural Aura-2 English voice
 
+    # End-of-turn detection (agent-side; read via os.getenv in app/agent/pipeline.py).
+    #   smart_turn — Smart Turn v3 ONNX prosody model decides when the caller is done
+    #                (fast when confident; VAD start still drives onset/interruptions,
+    #                and the analyzer's own 3s silence backstop guarantees a turn ends).
+    #   vad        — fall back to crude fixed-silence VAD endpointing (offline/low-CPU).
+    turn_detection: str = "smart_turn"          # smart_turn | vad
+    smart_turn_cpu_count: int = 1               # ONNX inference threads for Smart Turn
+
     # offline fallback (optional)
     ollama_base_url: str = "http://ollama:11434/v1"
     ollama_model: str = "llama3.1:8b"

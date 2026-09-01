@@ -52,4 +52,16 @@ def summary(session_id: int, session: Session = Depends(get_session)) -> dict:
     s = session.get(AssessmentSession, session_id)
     if s is None:
         return {"ok": False, "message": "Unknown session."}
-    return asv._summary(session, s, asv.get_questions(session, s.role))
+    # Live aggregate (derived from persisted answers) plus the stamped record fields
+    # (candidate_name + the rating written on completion) so the recruiter sees the
+    # stored result. Read-only: _summary does not mutate when not just_graded.
+    out = asv._summary(session, s, asv.get_questions(session, s.role))
+    out["session_id"] = s.id
+    out["candidate_name"] = s.candidate_name
+    out["persisted"] = {
+        "rating": s.rating, "average_score": s.average_score,
+        "correct_count": s.correct_count, "answered": s.answered,
+        "total_questions": s.total_questions,
+        "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+    }
+    return out
