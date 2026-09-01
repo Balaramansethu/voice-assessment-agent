@@ -73,8 +73,13 @@ def _grade(prompt: str, expected: str, key_points: list, answer: str) -> dict:
     kp = "\n".join(f"- {k}" for k in (key_points or []))
     user = (f"QUESTION: {prompt}\n\nEXPECTED ANSWER: {expected}\n\nKEY POINTS:\n{kp}\n\n"
             f"CANDIDATE ANSWER: {answer}\n\nGrade it.")
+    # Silent grading runs on its own model (groq_grader_model) — a reasoning model
+    # here is fine and desirable, since verdicts are recorded for the recruiter and
+    # never spoken. reasoning_format="hidden" keeps the chain-of-thought out of the
+    # JSON we parse. Decoupled from the conversational model so switching the voice
+    # model (to a non-reasoning one) doesn't send Groq params it would reject.
     resp = groq_client().chat.completions.create(
-        model=settings.groq_llm_model,
+        model=settings.groq_grader_model,
         messages=[{"role": "system", "content": _GRADER_SYSTEM},
                   {"role": "user", "content": user}],
         temperature=0.0,

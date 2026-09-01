@@ -16,16 +16,25 @@ class Settings(BaseSettings):
     # transport: webrtc (default, browser) | twilio (optional PSTN)
     transport_provider: str = "webrtc"
 
-    # inference — Groq free tier by default
-    stt_provider: str = "groq"      # groq | whisper
+    # inference — Groq LLM, Deepgram STT/TTS by default
+    stt_provider: str = "deepgram"  # deepgram
     llm_provider: str = "groq"      # groq | ollama
+    tts_provider: str = "deepgram"  # deepgram
     groq_api_key: str = ""
-    groq_llm_model: str = "openai/gpt-oss-120b"
-    groq_stt_model: str = "whisper-large-v3"
+    # Conversational voice model. This Groq tier exposes NO non-reasoning chat
+    # model (the llama-3.3 family 404s here), so we use gpt-oss-120b and hide its
+    # chain-of-thought via extra_body reasoning_format="hidden" (set on the voice
+    # GroqLLMService in pipeline.py). SpeakableTextFilter is the safety net that
+    # strips any residual punctuation-only fragments before they reach TTS.
+    groq_llm_model: str = "qwen/qwen3.8-27b"
+    # Silent grader model — separate from the voice model so grading can use a
+    # strong reasoning model (never spoken) without affecting turn latency.
+    groq_grader_model: str = "openai/gpt-oss-120b"
 
-    # TTS — local, no key
-    tts_provider: str = "kokoro"    # kokoro | piper
-    tts_voice: str = "af_heart"
+    # Deepgram — streaming STT (Nova) + TTS (Aura)
+    deepgram_api_key: str = ""
+    deepgram_stt_model: str = "nova-3"          # Nova-3 general (better accuracy, keyterm boosting)
+    deepgram_tts_voice: str = "aura-2-thalia-en"  # natural Aura-2 English voice
 
     # offline fallback (optional)
     ollama_base_url: str = "http://ollama:11434/v1"

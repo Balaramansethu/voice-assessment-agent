@@ -1,5 +1,5 @@
-"""Pipecat voice bot (Pipecat 1.7 API): WebRTC ⇄ Groq Whisper (STT) ⇄ Groq LLM
-⇄ Kokoro (local TTS).
+"""Pipecat voice bot (Pipecat 1.8 API): WebRTC ⇄ Deepgram Nova-3 (STT) ⇄ Groq LLM
+⇄ Deepgram Aura (TTS).
 
 End-to-end interview flow:
   on connect → resolve caller (DEMO_CALLER_PHONE) → recover interview state →
@@ -23,18 +23,19 @@ from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import LLMRunFrame
+from pipecat.frames.frames import Frame, LLMRunFrame, TextFrame
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import LLMContextAggregatorPair
 from pipecat.processors.audio.vad_processor import VADProcessor
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 from pipecat.runner.types import RunnerArguments
 from pipecat.runner.utils import create_transport
+from pipecat.services.deepgram.stt import DeepgramSTTService
+from pipecat.services.deepgram.tts import DeepgramTTSService
 from pipecat.services.groq.llm import GroqLLMService
-from pipecat.services.groq.stt import GroqSTTService
-from pipecat.services.kokoro.tts import KokoroTTSService
 from pipecat.services.llm_service import FunctionCallParams
 from pipecat.transports.base_transport import TransportParams
 from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
@@ -42,31 +43,6 @@ from pipecat.transports.websocket.fastapi import FastAPIWebsocketParams
 from app.agent import prompts
 from app.agent import tools
 
-import numpy as _np
-from pipecat.audio.filters.base_audio_filter import BaseAudioFilter
-
-
-class GainAudioFilter(BaseAudioFilter):
-    """Amplifies incoming mic audio BEFORE VAD/STT. Browser WebRTC audio arrives
-    quiet (~3% FS); this lifts it so Silero VAD detects speech and Whisper can
-    transcribe it. Runs inside the input transport, ahead of the VAD analyzer."""
-
-    def __init__(self, gain: float = 8.0):
-        self._gain = gain
-
-    async def start(self, sample_rate: int):
-        pass
-
-    async def stop(self):
-        pass
-
-    async def process_frame(self, frame):
-        pass
-
-    async def filter(self, audio: bytes) -> bytes:
-        s = _np.frombuffer(audio, dtype=_np.int16).astype(_np.float32) * self._gain
-        s = _np.clip(s, -32768, 32767).astype(_np.int16)
-        return s.tobytes()
 
 START_ASSESSMENT_SCHEMA = FunctionSchema(
     name="start_assessment",
@@ -98,12 +74,31 @@ KB_ANSWER_SCHEMA = FunctionSchema(
 )
 
 
+class SpeakableTextFilter(FrameProcessor):
+    """Drops LLM text fragments that have nothing speakable in them.
+
+    The LLM occasionally streams TextFrames whose stripped content is only
+    punctuation or a parenthetical aside ("...", "…", "( Noted )"). Fed to TTS
+    these produce "… .. Sorry…" garbage speech. We sit between the LLM and TTS
+    and swallow any TextFrame with no alphanumeric characters; every other frame
+    (LLMFullResponseStart/End, control frames) passes through untouched so the
+    TTS service's own sentence aggregation is unaffected.
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        # LLMTextFrame subclasses TextFrame; matching TextFrame covers both.
+        if isinstance(frame, TextFrame) and not any(c.isalnum() for c in frame.text):
+            return  # nothing to say — drop it before it reaches TTS
+        await self.push_frame(frame, direction)
+
+
 def _transport_params() -> dict:
     return {
-        # Browser: WebRTC audio is quiet (~3% FS) so we boost it before VAD.
+        # Browser: plain WebRTC in/out. Deepgram handles quiet mic audio natively,
+        # so no pre-amplification is needed ahead of VAD.
         "webrtc": lambda: TransportParams(
             audio_in_enabled=True,
-            audio_in_filter=GainAudioFilter(gain=8.0),
             audio_out_enabled=True,
         ),
         # Phone: Twilio needs FastAPIWebsocketParams (the runner sets add_wav_header
@@ -121,35 +116,68 @@ async def bot(runner_args: RunnerArguments) -> None:
     transport = await create_transport(runner_args, _transport_params())
 
     groq_key = os.environ["GROQ_API_KEY"]
-    stt = GroqSTTService(
-        api_key=groq_key,
-        settings=GroqSTTService.Settings(model=os.getenv("GROQ_STT_MODEL", "whisper-large-v3-turbo")),
+    deepgram_key = os.environ["DEEPGRAM_API_KEY"]
+    # Deepgram Nova-3 streaming STT. ONE turn-taking authority only: the Silero
+    # VADProcessor below owns turn boundaries and interruptions. We therefore
+    # DISABLE Deepgram-side endpointing (endpointing=False, utterance_end_ms unset)
+    # so Deepgram never also cuts a turn — running two detectors desynchronises them
+    # and splits a single spoken answer across two turns (Deepgram's voice-agent guide
+    # is explicit about this). In this pipecat (1.8.1) the Deepgram STT does not emit
+    # UserStarted/StoppedSpeaking anyway — it consumes the VAD's frames to fire a
+    # finalize — so the VAD must drive turns and Deepgram just transcribes.
+    # smart_format tidies numbers/punctuation; keyterm boosts domain vocab that was
+    # previously misheard (nova-3 keyterm prompting).
+    stt = DeepgramSTTService(
+        api_key=deepgram_key,
+        settings=DeepgramSTTService.Settings(
+            model=os.getenv("DEEPGRAM_STT_MODEL", "nova-3"),
+            endpointing=False,
+            smart_format=True,
+            keyterm=[
+                "debouncing", "memoization", "virtual DOM", "hydration",
+                "idempotency", "Postgres", "WebSocket", "Balaraman",
+            ],
+        ),
     )
     llm = GroqLLMService(
         api_key=groq_key,
+        # qwen3.8-27b: a conversational model on this Groq tier that streams CLEAN
+        # spoken content by default and calls our tools reliably. We deliberately do
+        # NOT use gpt-oss here: gpt-oss is a reasoning model whose only clean path is
+        # reasoning_format=hidden, and that param must ride in `extra_body` — but this
+        # Pipecat (1.8.1) drops the Settings `extra`/`extra_body` on the streaming
+        # create() call, so the suppression never reaches Groq and gpt-oss speaks its
+        # chain-of-thought ("GreatOopsWeSorryWe…"). Verified directly against Groq:
+        # gpt-oss+hidden is clean, but only when the param actually lands; qwen needs
+        # no such param. SpeakableTextFilter downstream still strips any stray
+        # punctuation-only fragment before TTS.
         settings=GroqLLMService.Settings(
-            model=os.getenv("GROQ_LLM_MODEL", "openai/gpt-oss-120b"),
-            # gpt-oss is a reasoning model; without this its chain-of-thought comes
-            # back in the `reasoning` field and Pipecat speaks it aloud. "hidden"
-            # drops reasoning so only the final answer is spoken. Pipecat spreads
-            # `extra` as top-level create() kwargs, so Groq-specific params must go
-            # inside `extra_body` (the OpenAI SDK forwards it to Groq).
-            extra={"extra_body": {"reasoning_format": "hidden", "reasoning_effort": "low"}},
+            model=os.getenv("GROQ_LLM_MODEL", "qwen/qwen3.8-27b"),
         ),
     )
-    tts = KokoroTTSService(
-        settings=KokoroTTSService.Settings(voice=os.getenv("TTS_VOICE", "af_heart")),
+    # Deepgram Aura streaming TTS.
+    tts = DeepgramTTSService(
+        api_key=deepgram_key,
+        voice=os.getenv("DEEPGRAM_TTS_VOICE", "aura-2-thalia-en"),
     )
 
-    # VAD must be a pipeline processor in Pipecat 1.7 (NOT a TransportParams field).
-    # It emits UserStarted/StoppedSpeaking, which drives the segmented Groq STT.
-    # stop_secs is generous (1.5s) so a natural pause mid-answer doesn't end the
-    # turn — this prevents answers being truncated or landing on the wrong question,
-    # which we saw on phone calls. Confidence 0.5 reduces false triggers on line noise.
+    # Silero VAD is the SINGLE turn-taking authority (Deepgram endpointing is off).
+    # It emits the VADUserStarted/StoppedSpeaking frames the context aggregator turns
+    # into user turns and interruptions. Tuning:
+    #   stop_secs=2.0 — a longer trailing-silence window so a natural mid-answer pause
+    #     ("The washing machine is working … twenty four by seven") stays ONE turn and
+    #     one submit_answer call, instead of splitting onto the wrong question.
+    #   confidence=0.6 — Silero's neural speech/non-speech score is the real gate and
+    #     rejects breath/background noise on its own. min_volume=0.0 disables the raw
+    #     amplitude gate: browser WebRTC audio arrives quiet (~3% full-scale) and the
+    #     old GainAudioFilter that boosted it is gone, so any non-zero min_volume would
+    #     reject normal mic input and make the agent deaf. WebRTC echo cancellation
+    #     stops the bot from hearing its own playback, so we don't need the gate for
+    #     barge-in control. Real speech still interrupts.
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
-            params=VADParams(confidence=0.5, start_secs=0.2,
-                             stop_secs=1.5, min_volume=0.0),
+            params=VADParams(confidence=0.6, start_secs=0.2,
+                             stop_secs=2.0, min_volume=0.0),
         ),
     )
 
@@ -222,10 +250,11 @@ async def bot(runner_args: RunnerArguments) -> None:
 
     pipeline = Pipeline([
         transport.input(),
-        vad,           # emits UserStarted/StoppedSpeaking → drives segmented STT
-        stt,
+        vad,           # sole turn detector → emits VAD speaking frames for the aggregator
+        stt,           # Deepgram transcribes only (endpointing disabled)
         user_agg,
         llm,
+        SpeakableTextFilter(),   # drop punctuation-only fragments before TTS
         tts,
         transport.output(),
         assistant_agg,
@@ -239,13 +268,16 @@ async def bot(runner_args: RunnerArguments) -> None:
                                         from_number="browser-webrtc", transport="webrtc")
         state["call_id"] = info.get("call_id")
 
+        # The greeting kickoff must be a USER message, not a system one: qwen's chat
+        # template raises "No user query found in messages" if a turn has only system
+        # messages (gpt-oss tolerated it; qwen does not). Framing it as the call
+        # connecting makes the model greet naturally in response.
         context.set_messages([
             {"role": "system", "content": prompts.SYSTEM_AGENT},
-            {"role": "system", "content":
-             "This is the very first turn. Greet the caller warmly, say you're the automated "
-             "screening assistant, and ask which role they're interviewing for (for example "
-             "Backend Engineer or Frontend Engineer). Do NOT call any function on this turn — "
-             "wait for them to name a role."},
+            {"role": "user", "content":
+             "The call just connected. Greet me warmly, say you're the automated screening "
+             "assistant, and ask which role I'm interviewing for (for example Backend Engineer "
+             "or Frontend Engineer). Do NOT call any function yet — wait for me to name a role."},
         ])
         await task.queue_frames([LLMRunFrame()])
 
