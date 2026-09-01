@@ -1,6 +1,6 @@
 """Headless WebRTC smoke test: connect to the live agent, receive its greeting
-audio. Proves the real pipeline (WebRTC media + Groq LLM + Kokoro TTS) works end to
-end without a mic. Run inside the agent container:
+audio. Proves the real pipeline (WebRTC media + Groq LLM + Deepgram TTS) works end
+to end without a mic. Run inside the agent container:
     docker compose exec agent python -m app.agent._smoketest
 """
 import asyncio
@@ -66,7 +66,7 @@ async def main():
     print("offer accepted, pc_id:", ans.get("pc_id"))
     await pc.setRemoteDescription(RTCSessionDescription(sdp=ans["sdp"], type=ans["type"]))
 
-    # Wait up to 90s for the greeting audio (first run downloads the Kokoro model).
+    # Wait up to 90s for the greeting audio (Deepgram Aura streams over the network).
     for _ in range(90):
         await asyncio.sleep(1)
         if got["audio_frames"] > 5:
