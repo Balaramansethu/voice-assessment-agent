@@ -27,25 +27,54 @@ def init_db() -> None:
     _create_rag_indexes()
 
 
+# (table, column, type) tuples for additive columns the models gained after their
+# table was first created. `create_all` never ALTERs an existing table, so we backfill
+# them here. Nullable/additive only — safe, never drops or rewrites data.
+_ADDITIVE_COLUMNS: list[tuple[str, str, str]] = [
+    # AssessmentSession aggregate result (recruiter-facing, silent grading; 0..10).
+    ("assessment_session", "total_questions", "INTEGER"),
+    ("assessment_session", "answered", "INTEGER"),
+    ("assessment_session", "passed_count", "INTEGER"),
+    ("assessment_session", "overall_score", "DOUBLE PRECISION"),
+    ("assessment_session", "rating", "VARCHAR(20)"),
+    ("assessment_session", "completed_at", "TIMESTAMPTZ"),
+    # AssessmentAnswer per-answer 0..10 rubric fields (new grader).
+    ("assessment_answer", "rating", "VARCHAR(20)"),
+    ("assessment_answer", "passed", "BOOLEAN"),
+    ("assessment_answer", "reason", "TEXT"),
+    ("assessment_answer", "required_covered", "JSONB"),
+    ("assessment_answer", "important_covered", "JSONB"),
+    ("assessment_answer", "important_missed", "JSONB"),
+    ("assessment_answer", "optional_missed", "JSONB"),
+    ("assessment_answer", "technical_errors", "JSONB"),
+]
+
+
 def _apply_lightweight_migrations() -> None:
     """Additive column backfills for tables that already exist in the running DB.
 
-    `create_all` only CREATEs missing tables — it never ALTERs an existing one, so
-    columns added to a model after its table was first created won't appear. Until
-    Alembic lands, we apply idempotent `ADD COLUMN IF NOT EXISTS` here. Additive and
-    nullable only (safe to run on every startup); never drops or rewrites data."""
-    stmts = [
-        # AssessmentSession aggregate result (recruiter-facing, silent grading).
-        "ALTER TABLE assessment_session ADD COLUMN IF NOT EXISTS total_questions INTEGER",
-        "ALTER TABLE assessment_session ADD COLUMN IF NOT EXISTS answered INTEGER",
-        "ALTER TABLE assessment_session ADD COLUMN IF NOT EXISTS correct_count INTEGER",
-        "ALTER TABLE assessment_session ADD COLUMN IF NOT EXISTS average_score DOUBLE PRECISION",
-        "ALTER TABLE assessment_session ADD COLUMN IF NOT EXISTS rating VARCHAR(20)",
-        "ALTER TABLE assessment_session ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ",
-    ]
+    We check information_schema first and only ALTER columns that are genuinely
+    MISSING. This matters for correctness, not just tidiness: `ALTER TABLE ... ADD
+    COLUMN` takes an ACCESS EXCLUSIVE lock, so an unconditional statement on every
+    startup would block behind (and against) live traffic already reading the table
+    — the api runs on the same Postgres. In steady state (columns present) this path
+    issues zero DDL and takes no exclusive lock. A short lock_timeout keeps a genuine
+    first-run migration from hanging forever if another session holds the table."""
     with engine.begin() as conn:
-        for s in stmts:
-            conn.execute(text(s))
+        existing = {
+            (row.table_name, row.column_name)
+            for row in conn.execute(text(
+                "SELECT table_name, column_name FROM information_schema.columns "
+                "WHERE table_name IN ('assessment_session', 'assessment_answer')"
+            ))
+        }
+        missing = [(t, c, ty) for (t, c, ty) in _ADDITIVE_COLUMNS
+                   if (t, c) not in existing]
+        if not missing:
+            return
+        conn.execute(text("SET lock_timeout = '5s'"))
+        for table, col, coltype in missing:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col} {coltype}"))
 
 
 def _create_rag_indexes() -> None:

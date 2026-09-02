@@ -15,23 +15,37 @@ def _session():
     return SessionLocal()
 
 
-def _drive_to_completion(s, session_id, scores):
-    """Grade every question, feeding one stubbed score per call, return last result."""
-    res = None
-    for _ in scores:
-        res = asv.grade_answer(s, session_id=session_id, transcript="an answer")
-        s.commit()
-    return res
+def _stub_grade_for(scores):
+    """Return a deterministic `_grade` replacement that yields the given 0..10 scores
+    in order, shaped exactly like the real grader's output (0..10 rubric)."""
+    it = iter(scores)
+
+    def _stub(prompt, expected, key_points, answer):
+        score = float(next(it))
+        return {
+            "score": score,
+            "rating": asv._rating_band(score),
+            "passed": score >= asv.PASS_THRESHOLD,
+            "reason": "stub",
+            "required_covered": [], "important_covered": [],
+            "important_missed": [], "optional_missed": [], "technical_errors": [],
+        }
+
+    return _stub
 
 
 def test_rating_band_thresholds():
-    # strong >= 0.7, mixed 0.4..0.69, weak < 0.4, None passthrough
-    assert asv._rating_band(1.0) == "strong"
-    assert asv._rating_band(0.7) == "strong"
-    assert asv._rating_band(0.69) == "mixed"
-    assert asv._rating_band(0.4) == "mixed"
-    assert asv._rating_band(0.39) == "weak"
-    assert asv._rating_band(0.0) == "weak"
+    # 0..10 client-spec bands: Excellent>=9, Strong>=8, Good>=7, Partial>=5,
+    # Weak>=3, Incorrect<3; None passthrough.
+    assert asv._rating_band(10.0) == "Excellent"
+    assert asv._rating_band(9.0) == "Excellent"
+    assert asv._rating_band(8.0) == "Strong"
+    assert asv._rating_band(7.0) == "Good"
+    assert asv._rating_band(6.9) == "Partial"
+    assert asv._rating_band(5.0) == "Partial"
+    assert asv._rating_band(3.0) == "Weak"
+    assert asv._rating_band(2.9) == "Incorrect"
+    assert asv._rating_band(0.0) == "Incorrect"
     assert asv._rating_band(None) is None
 
 
@@ -42,20 +56,15 @@ def test_name_and_rating_persist_on_completion(monkeypatch):
     sid = start["session_id"]
     total = start["total_questions"]
 
-    # Deterministic judge: alternate strong/weak so the average is well-defined.
-    scores = [1.0, 0.0] * total
-    scores = scores[:total]
-    it = iter(scores)
+    # Deterministic judge: alternate strong/weak so the average is well-defined and
+    # no live Groq call is made.
+    scores = ([9.0, 4.0] * total)[:total]
+    monkeypatch.setattr(asv, "_grade", _stub_grade_for(scores))
 
-    def _stub_grade(prompt, expected, key_points, answer):
-        sc = next(it)
-        verdict = "correct" if sc >= 0.7 else "partial" if sc >= 0.4 else "incorrect"
-        return {"verdict": verdict, "score": sc, "covered": [], "missing": [],
-                "rationale": "stub"}
-
-    monkeypatch.setattr(asv, "_grade", _stub_grade)
-
-    res = _drive_to_completion(s, sid, scores)
+    res = None
+    for _ in scores:
+        res = asv.grade_answer(s, session_id=sid, transcript="an answer")
+        s.commit()
     assert res["done"] is True
 
     # The persisted row carries the name AND the derived aggregate rating.
@@ -65,19 +74,19 @@ def test_name_and_rating_persist_on_completion(monkeypatch):
     assert row.completed_at is not None
     assert row.total_questions == total
     assert row.answered == total
-    expected_avg = round(sum(scores) / len(scores), 2)
-    assert row.average_score == expected_avg
-    assert row.correct_count == sum(1 for sc in scores if sc >= 0.7)
-    assert row.rating == asv._rating_band(expected_avg)
+    expected_overall = round(sum(scores) / len(scores), 1)
+    assert row.overall_score == expected_overall
+    assert row.passed_count == sum(1 for sc in scores if sc >= asv.PASS_THRESHOLD)
+    assert row.rating == asv._rating_band(expected_overall)
 
     # The persisted values agree with the live-derived summary (single scoring path).
     summary = asv._summary(s, row, asv.get_questions(s, row.role))
-    assert summary["average_score"] == row.average_score
-    assert summary["rating"] == row.rating
+    assert summary["overall_score"] == row.overall_score
+    assert summary["overall_rating"] == row.rating
     assert summary["candidate_name"] == row.candidate_name
 
 
-def test_summary_is_read_only_when_not_just_graded(monkeypatch):
+def test_summary_is_read_only_when_not_just_graded():
     """The summary endpoint path must not stamp/mutate a session it merely reads."""
     s = _session()
     start = asv.start_session(s, "Backend Engineer", candidate_name="Ada")

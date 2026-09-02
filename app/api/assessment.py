@@ -59,8 +59,8 @@ def summary(session_id: int, session: Session = Depends(get_session)) -> dict:
     out["session_id"] = s.id
     out["candidate_name"] = s.candidate_name
     out["persisted"] = {
-        "rating": s.rating, "average_score": s.average_score,
-        "correct_count": s.correct_count, "answered": s.answered,
+        "rating": s.rating, "overall_score": s.overall_score,
+        "passed_count": s.passed_count, "answered": s.answered,
         "total_questions": s.total_questions,
         "completed_at": s.completed_at.isoformat() if s.completed_at else None,
     }

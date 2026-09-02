@@ -5,6 +5,7 @@ from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -238,9 +239,9 @@ class AssessmentSession(Base):
     # NULL until completion; derived from assessment_answer (single source of truth).
     total_questions: Mapped[int | None] = mapped_column(Integer)
     answered: Mapped[int | None] = mapped_column(Integer)
-    correct_count: Mapped[int | None] = mapped_column(Integer)
-    average_score: Mapped[float | None] = mapped_column(Float)   # 0..1
-    rating: Mapped[str | None] = mapped_column(String(20))       # strong | mixed | weak
+    passed_count: Mapped[int | None] = mapped_column(Integer)     # answers scoring >= 7/10
+    overall_score: Mapped[float | None] = mapped_column(Float)    # 0..10
+    rating: Mapped[str | None] = mapped_column(String(20))        # Excellent..Incorrect band
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _now()
 
@@ -254,8 +255,18 @@ class AssessmentAnswer(Base):
     question_id: Mapped[int] = mapped_column(ForeignKey("role_question.id"))
     position: Mapped[int] = mapped_column(Integer)
     transcript: Mapped[str] = mapped_column(Text)
-    verdict: Mapped[str | None] = mapped_column(String(20))   # correct | partial | incorrect
-    score: Mapped[float | None] = mapped_column(Float)        # 0..1
+    score: Mapped[float | None] = mapped_column(Float)        # 0..10 (weighted rubric)
+    rating: Mapped[str | None] = mapped_column(String(20))    # Excellent | Strong | Good | Partial | Weak | Incorrect
+    passed: Mapped[bool | None] = mapped_column(Boolean)      # score >= 7.0
+    reason: Mapped[str | None] = mapped_column(Text)
+    required_covered: Mapped[list | None] = mapped_column(JSONB)
+    important_covered: Mapped[list | None] = mapped_column(JSONB)
+    important_missed: Mapped[list | None] = mapped_column(JSONB)
+    optional_missed: Mapped[list | None] = mapped_column(JSONB)
+    technical_errors: Mapped[list | None] = mapped_column(JSONB)
+    # Legacy columns from the old 0..1 verdict grader; retained for rows graded before
+    # the 0..10 rubric so historical data still reads. Not written by the new grader.
+    verdict: Mapped[str | None] = mapped_column(String(20))
     covered: Mapped[list | None] = mapped_column(JSONB)
     missing: Mapped[list | None] = mapped_column(JSONB)
     rationale: Mapped[str | None] = mapped_column(Text)
