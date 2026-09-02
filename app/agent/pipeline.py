@@ -36,9 +36,12 @@ from pipecat.processors.aggregators.llm_response_universal import (
     LLMUserAggregatorParams,
 )
 from pipecat.processors.audio.vad_processor import VADProcessor
-from pipecat.turns.user_turn_strategies import (
-    UserTurnStrategies,
-    default_user_turn_start_strategies,
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
+    MinWordsUserTurnStartStrategy,
+)
+from pipecat.turns.user_start.transcription_user_turn_start_strategy import (
+    TranscriptionUserTurnStartStrategy,
 )
 from pipecat.turns.user_stop.base_user_turn_stop_strategy import (
     BaseUserTurnStopStrategy,
@@ -94,22 +97,47 @@ KB_ANSWER_SCHEMA = FunctionSchema(
 )
 
 
-class SpeakableTextFilter(FrameProcessor):
-    """Drops LLM text fragments that have nothing speakable in them.
+# Matches a fragment made up solely of dots/ellipses (e.g. "..", "...", "…", ". . .").
+# A single "." is intentionally NOT caught here — see _is_unspeakable.
+_DOTS_ONLY_RE = re.compile(r"^[.…]+$")
 
-    The LLM occasionally streams TextFrames whose stripped content is only
-    punctuation or a parenthetical aside ("...", "…", "( Noted )"). Fed to TTS
-    these produce "… .. Sorry…" garbage speech. We sit between the LLM and TTS
-    and swallow any TextFrame with no alphanumeric characters; every other frame
-    (LLMFullResponseStart/End, control frames) passes through untouched so the
-    TTS service's own sentence aggregation is unaffected.
+
+def _is_unspeakable(text: str) -> bool:
+    """True only for fragments TTS should never receive: pure whitespace, or a run of
+    dots/ellipses that is spam rather than a real sentence mark.
+
+    Dot-run spam is a relic of the old gpt-oss reasoning model. We drop it, but we KEEP
+    a lone "." (and every other single mark ",", "?", "!", ";", ":") because qwen streams
+    sentence punctuation as standalone tokens and those marks give the TTS its prosody.
+    So a dots-only fragment is spam iff it has 2+ characters OR contains an ellipsis "…"
+    (U+2026 already reads as three dots). Pure — easily unit-tested.
+    Examples: ""/"  " → True; ".."/"..."/"…" → True; "."/"?"/"Hi" → False.
+    """
+    stripped = "".join(text.split())  # collapse all whitespace, including between dots
+    if not stripped:
+        return True
+    if _DOTS_ONLY_RE.match(stripped):
+        return len(stripped) >= 2 or "…" in stripped
+    return False
+
+
+class SpeakableTextFilter(FrameProcessor):
+    """Drops LLM text fragments that are ellipsis/dot-run spam or pure whitespace.
+
+    qwen streams clean spoken content, but it also streams sentence punctuation as
+    STANDALONE tokens (".", ",", "?", "!"). Those marks are exactly what gives the TTS
+    its prosody — pauses and intonation — and let it chunk sentences promptly, so they
+    MUST pass through. We therefore suppress only the narrow garbage case: a run of two
+    or more dots/ellipses ("..", "...", "…"), a leftover from the old gpt-oss reasoning
+    model. Every other frame (real punctuation, words, LLMFullResponseStart/End, control
+    frames) passes untouched so the TTS service's own sentence aggregation is unaffected.
     """
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
         await super().process_frame(frame, direction)
         # LLMTextFrame subclasses TextFrame; matching TextFrame covers both.
-        if isinstance(frame, TextFrame) and not any(c.isalnum() for c in frame.text):
-            return  # nothing to say — drop it before it reaches TTS
+        if isinstance(frame, TextFrame) and _is_unspeakable(frame.text):
+            return  # dot-spam / whitespace only — drop it before it reaches TTS
         await self.push_frame(frame, direction)
 
 
@@ -231,9 +259,12 @@ async def bot(runner_args: RunnerArguments) -> None:
 
     # Turn-taking is now a TWO-SIGNAL system, and the two have distinct jobs:
     #
-    #   START / interruptions  → Silero VAD (VADUserTurnStartStrategy, below).
-    #     VAD still detects speech ONSET and drives barge-in. Nothing about start
-    #     behavior changes.
+    #   START / interruptions  → min-words gate (MinWordsUserTurnStartStrategy, below).
+    #     A turn (and any barge-in interruption) begins on TRANSCRIBED WORDS, not a raw
+    #     VAD edge: while the bot is speaking it takes >= INTERRUPTION_MIN_WORDS words to
+    #     interrupt, so breath/echo/one-word blips can't cancel the reply; when the bot
+    #     is silent a single word starts the turn, so onset latency is unchanged. The
+    #     Silero VAD below still detects speech edges (it feeds Smart Turn its pauses).
     #   STOP / end-of-turn      → Smart Turn v3 (TurnAnalyzerUserTurnStopStrategy).
     #     A small ONNX prosody model predicts whether the caller has genuinely
     #     finished their thought, rather than timing a fixed silence. It decides
@@ -257,8 +288,9 @@ async def bot(runner_args: RunnerArguments) -> None:
     #     amplitude gate: browser WebRTC audio arrives quiet (~3% full-scale) and the
     #     old GainAudioFilter that boosted it is gone, so any non-zero min_volume would
     #     reject normal mic input and make the agent deaf. WebRTC echo cancellation
-    #     stops the bot from hearing its own playback, so we don't need the gate for
-    #     barge-in control. Real speech still interrupts.
+    #     stops the bot from hearing its own playback; barge-in is gated by the
+    #     min-words START strategy above, not by VAD, so noise can't interrupt while a
+    #     real spoken sentence still does.
     vad = VADProcessor(
         vad_analyzer=SileroVADAnalyzer(
             params=VADParams(confidence=0.6, start_secs=0.2,
@@ -266,8 +298,8 @@ async def bot(runner_args: RunnerArguments) -> None:
         ),
     )
 
-    # End-of-turn STOP strategy. START is always VAD + transcription (below); only
-    # the stop signal is switchable via TURN_DETECTION.
+    # End-of-turn STOP strategy. START is always the min-words + transcription gate
+    # (below); only the stop signal is switchable via TURN_DETECTION.
     #
     #   smart_turn (default) — Smart Turn v3. The 8.6MB ONNX is baked into the agent
     #     image (bundled with Pipecat), so passing no model path loads it from disk
@@ -281,7 +313,9 @@ async def bot(runner_args: RunnerArguments) -> None:
     # name SpeechTimeoutUserTurnStopStrategy to genuinely opt out of the model.
     turn_detection = os.getenv("TURN_DETECTION", "smart_turn").strip().lower()
     smart_turn_cpus = int(os.getenv("SMART_TURN_CPU_COUNT", "2"))
-    smart_turn_stop_secs = float(os.getenv("SMART_TURN_STOP_SECS", "1.0"))
+    # Backstop is a SAFETY NET, not the decider: raised 1.0 → 2.0 so an unsure caller
+    # mid-thought is not force-closed and fragmented. Smart Turn owns the real decision.
+    smart_turn_stop_secs = float(os.getenv("SMART_TURN_STOP_SECS", "2.0"))
     if turn_detection == "smart_turn":
         # The stop strategy is self-driving: it consumes the InputAudioRawFrame /
         # VAD / transcription frames already flowing through the user aggregator,
@@ -292,8 +326,9 @@ async def bot(runner_args: RunnerArguments) -> None:
         stop_strategy: BaseUserTurnStopStrategy = TurnAnalyzerUserTurnStopStrategy(
             turn_analyzer=LocalSmartTurnAnalyzerV3(
                 cpu_count=smart_turn_cpus,
-                # Tighten the hard-silence backstop 3.0s → 1.0s so an unsure model
-                # doesn't make the caller wait; it still fires fast when confident.
+                # Hard-silence backstop is a SAFETY NET only (2.0s). Smart Turn is the
+                # primary decider and fires fast when confident; this just rescues a
+                # turn the model never resolves, without cutting a mid-thought caller off.
                 params=SmartTurnParams(
                     stop_secs=smart_turn_stop_secs,
                     pre_speech_ms=500,
@@ -306,8 +341,27 @@ async def bot(runner_args: RunnerArguments) -> None:
         # Fixed-silence fallback: end the turn a short window after VAD reports
         # silence, once a final transcript has landed. No prosody model.
         stop_strategy = SpeechTimeoutUserTurnStopStrategy(wait_for_transcript=True)
+    # Barge-in gate (FIX: interruption storm). The framework default START set is
+    # [VADUserTurnStartStrategy, TranscriptionUserTurnStartStrategy], and VAD-start
+    # begins a user turn — and broadcasts an interruption that cancels the in-flight
+    # bot reply — on a SINGLE raw VAD event (a breath, echo or one-word blip). That
+    # fired ~12 generations in a 45s window, ~11 of them cancelled before a word
+    # reached TTS. We replace VADUserTurnStartStrategy with Pipecat's own
+    # MinWordsUserTurnStartStrategy: while the bot is speaking it requires
+    # >= INTERRUPTION_MIN_WORDS transcribed words before it starts a turn (so noise /
+    # echo / a single "uh" no longer interrupts), yet a real spoken sentence still cuts
+    # in within ~1s. When the bot is SILENT it triggers on a single word, so normal
+    # turn-taking latency is unchanged. This is the production standard (min-words
+    # barge-in) and, as a bonus, means a VAD-only noise turn with no transcript never
+    # starts a turn at all — so the LLM is never asked to fill silence (FIX: babbling).
+    # We keep TranscriptionUserTurnStartStrategy alongside it (the min-words strategy
+    # itself consumes transcripts; the pair matches the framework default shape).
+    interruption_min_words = int(os.getenv("INTERRUPTION_MIN_WORDS", "3"))
     user_turn_strategies = UserTurnStrategies(
-        start=default_user_turn_start_strategies(),  # keep VAD + transcription START
+        start=[
+            MinWordsUserTurnStartStrategy(min_words=interruption_min_words),
+            TranscriptionUserTurnStartStrategy(),
+        ],
         stop=[stop_strategy],
     )
 

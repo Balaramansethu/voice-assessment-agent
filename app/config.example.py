@@ -37,17 +37,24 @@ class Settings(BaseSettings):
     deepgram_tts_voice: str = "aura-2-thalia-en"  # natural Aura-2 English voice
 
     # End-of-turn detection (agent-side; read via os.getenv in app/agent/pipeline.py).
-    #   smart_turn — Smart Turn v3 ONNX prosody model decides when the caller is done
-    #                (fast when confident; VAD start still drives onset/interruptions,
-    #                and the analyzer's own 3s silence backstop guarantees a turn ends).
+    #   smart_turn — Smart Turn v3 ONNX prosody model is the PRIMARY end-of-turn decider:
+    #                it reads prosody and says COMPLETE when the caller has genuinely
+    #                finished, holding the turn open through mid-answer pauses. The
+    #                hard-silence backstop below is only a safety net for a stuck turn.
     #   vad        — fall back to crude fixed-silence VAD endpointing (offline/low-CPU).
     turn_detection: str = "smart_turn"          # smart_turn | vad
     smart_turn_cpu_count: int = 2               # ONNX inference threads for Smart Turn
-    # Hard-silence backstop inside the Smart Turn analyzer: when the prosody model
-    # never says COMPLETE (an unsure turn), the turn is forced closed after this many
-    # seconds of silence. Analyzer default is 3.0s; ~1s means an unsure caller waits
-    # ~1s, not 3, before their turn ends. VAD stop_secs (0.2) is only the onset trigger.
-    smart_turn_stop_secs: float = 1.0
+    # Hard-silence backstop inside the Smart Turn analyzer. Smart Turn is the primary
+    # decider; this only RESCUES a turn the model never resolves (never says COMPLETE).
+    # Set generously (2.0s) so a caller mid-thought is not force-closed and fragmented:
+    # a tighter value (e.g. 1.0s) fires while Smart Turn still judges the turn INCOMPLETE,
+    # cutting answers off. VAD stop_secs (0.2) is only the onset trigger, not this.
+    smart_turn_stop_secs: float = 2.0
+    # Barge-in gate. While the bot is speaking, an interruption fires only once the
+    # caller has spoken at least this many transcribed words — noise/breath/echo and
+    # one-word blips no longer cancel the bot's reply, but a real sentence still cuts
+    # in within ~1s. When the bot is silent a single word starts the turn as usual.
+    interruption_min_words: int = 3
 
     # offline fallback (optional)
     ollama_base_url: str = "http://ollama:11434/v1"
