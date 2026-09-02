@@ -70,15 +70,22 @@ def test_name_and_rating_persist_on_completion(monkeypatch):
 
     # Distinct transcript per question (as in production — each answers a different
     # prompt); a repeated transcript would trip the duplicate-submit idempotency guard.
+    # Submit fast (no grading in-path), collecting answer_ids to grade in the background.
     res = None
+    answer_ids = []
     for i in range(len(scores)):
         res = asv.grade_answer(s, session_id=sid, transcript=f"an answer {i}")
         s.commit()
+        answer_ids.append(res["_answer_id"])
     assert res["done"] is True
+
+    # Grading + completion stamping now happen in the background (own session_scope).
+    for aid in answer_ids:
+        asv.grade_pending_answer(aid)
+    s.expire_all()
 
     # The persisted row carries the name AND the derived aggregate rating.
     row = s.get(AssessmentSession, sid)
-    s.refresh(row)
     assert row.candidate_name == "Grace Hopper"
     assert row.completed_at is not None
     assert row.total_questions == total
@@ -157,6 +164,185 @@ def test_empty_transcript_is_idempotent_no_op(monkeypatch):
         assert res["done"] is False
         assert res["next_question"]["position"] == first_q["position"]
         assert _answer_count(s, sid) == 0          # nothing inserted, position 0 held
+
+
+def test_submit_returns_next_question_before_grading(monkeypatch):
+    """Fast-submit path: submitting an answer inserts the row and returns the next
+    question WITHOUT the grade present yet (silent grading is off the critical path).
+    The row exists with score NULL until the scheduled background task runs."""
+    s = _session()
+    start = asv.start_session(s, "Backend Engineer", candidate_name="Fast Fiona")
+    s.commit()
+    sid = start["session_id"]
+
+    # Any call to _grade in the request path would be a regression — fail loudly.
+    def _boom(*a, **k):
+        raise AssertionError("_grade must NOT run in the submit/request path")
+
+    monkeypatch.setattr(asv, "_grade", _boom)
+
+    res = asv.grade_answer(s, session_id=sid, transcript="an ungraded answer")
+    s.commit()
+    assert res["done"] is False
+    assert res["next_question"]["position"] == 2
+    answer_id = res["_answer_id"]
+
+    # The row is persisted immediately, ungraded (score/rating NULL).
+    row = s.get(AssessmentAnswer, answer_id)
+    s.refresh(row)
+    assert row.transcript == "an ungraded answer"
+    assert row.position == 1
+    assert row.score is None and row.rating is None
+    # And the session aggregate is NOT stamped yet.
+    sess = s.get(AssessmentSession, sid)
+    assert sess.completed_at is None
+
+
+def test_background_grade_populates_and_stamps_once(monkeypatch):
+    """After running each scheduled grade task, scores populate and — once every answer
+    is graded — the session stamps overall_score/rating/passed_count/completed_at exactly
+    once. `grade_pending_answer` opens its own session_scope(), matching production."""
+    s = _session()
+    start = asv.start_session(s, "Backend Engineer", candidate_name="Bg Bella")
+    s.commit()
+    sid = start["session_id"]
+    total = start["total_questions"]
+
+    scores = ([9.0, 4.0] * total)[:total]
+    monkeypatch.setattr(asv, "_grade", _stub_grade_for(scores))
+
+    # Submit every answer (fast path), collecting the answer_ids to grade.
+    answer_ids = []
+    for i in range(total):
+        res = asv.grade_answer(s, session_id=sid, transcript=f"an answer {i}")
+        s.commit()
+        answer_ids.append(res["_answer_id"])
+
+    # Nothing graded/stamped yet — all rows NULL, session not completed.
+    sess = s.get(AssessmentSession, sid)
+    s.refresh(sess)
+    assert sess.completed_at is None
+    assert (s.scalar(select(func.count(AssessmentAnswer.id)).where(
+        AssessmentAnswer.session_id == sid, AssessmentAnswer.score.is_(None))) or 0) == total
+
+    # Run the scheduled background grades (own session_scope each).
+    for aid in answer_ids:
+        asv.grade_pending_answer(aid)
+
+    # Re-read from a fresh session (background tasks committed to their own).
+    s.expire_all()
+    row = s.get(AssessmentSession, sid)
+    assert row.completed_at is not None
+    assert row.total_questions == total
+    assert row.answered == total
+    expected_overall = round(sum(scores) / len(scores), 1)
+    assert row.overall_score == expected_overall
+    assert row.passed_count == sum(1 for sc in scores if sc >= asv.PASS_THRESHOLD)
+    assert row.rating == asv._rating_band(expected_overall)
+
+    # Per-answer scores populated 1:1 with the stubbed values, in position order.
+    rows = s.scalars(select(AssessmentAnswer).where(AssessmentAnswer.session_id == sid)
+                     .order_by(AssessmentAnswer.position)).all()
+    assert [r.score for r in rows] == scores
+
+    # Once-only: re-running any grade (idempotent) must NOT re-stamp a different value.
+    stamped_at = row.completed_at
+    asv.grade_pending_answer(answer_ids[-1])
+    s.expire_all()
+    row2 = s.get(AssessmentSession, sid)
+    assert row2.completed_at == stamped_at
+
+
+def test_grade_pending_stamps_exactly_once_when_last_grades_race(monkeypatch):
+    """The last answer's grade is what flips the session complete. Running the final
+    two grades back-to-back must stamp exactly once (completed_at guard + row lock)."""
+    s = _session()
+    start = asv.start_session(s, "Backend Engineer", candidate_name="Race Rhea")
+    s.commit()
+    sid = start["session_id"]
+    total = start["total_questions"]
+    assert total >= 2
+
+    scores = [8.0] * total
+    monkeypatch.setattr(asv, "_grade", _stub_grade_for(scores))
+
+    answer_ids = [asv.grade_answer(s, session_id=sid, transcript=f"a {i}")["_answer_id"]
+                  for i in range(total)]
+    s.commit()
+
+    # Grade all but the last two, then the last two consecutively.
+    for aid in answer_ids[:-2]:
+        asv.grade_pending_answer(aid)
+    s.expire_all()
+    assert s.get(AssessmentSession, sid).completed_at is None
+
+    asv.grade_pending_answer(answer_ids[-2])
+    asv.grade_pending_answer(answer_ids[-1])
+    s.expire_all()
+    row = s.get(AssessmentSession, sid)
+    assert row.completed_at is not None
+    assert row.answered == total
+
+
+def test_grade_endpoint_schedules_background_task(monkeypatch):
+    """Endpoint-level: POST /assessment/grade returns the next question and schedules the
+    background grade via BackgroundTasks (which TestClient runs after the response). The
+    response must NOT carry the internal _answer_id."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    init_db()
+    with SessionLocal() as setup:
+        start = asv.start_session(setup, "Backend Engineer", candidate_name="Api Amy")
+        setup.commit()
+        sid = start["session_id"]
+
+    monkeypatch.setattr(asv, "_grade", _stub_grade_for([9.0]))
+
+    client = TestClient(app)
+    resp = client.post("/assessment/grade",
+                       json={"session_id": sid, "transcript": "endpoint answer"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["done"] is False
+    assert "_answer_id" not in body                 # internal handle stripped
+
+    # TestClient runs BackgroundTasks synchronously after the response, so by now the
+    # first answer is graded (its own session_scope committed).
+    with SessionLocal() as check:
+        row = check.scalars(select(AssessmentAnswer)
+                            .where(AssessmentAnswer.session_id == sid)).first()
+        assert row is not None
+        assert row.transcript == "endpoint answer"
+        assert row.score == 9.0                     # background task populated the score
+
+
+def test_summary_and_answers_tolerate_null_scores_mid_grading(monkeypatch):
+    """Mid-grading (rows inserted, not yet graded) the recruiter's /summary and /answers
+    must not crash on NULL scores — they show partial/NULL aggregate until the background
+    grades land. _summary already skips None when averaging (single scoring path)."""
+    s = _session()
+    start = asv.start_session(s, "Backend Engineer", candidate_name="Mid Mona")
+    s.commit()
+    sid = start["session_id"]
+
+    def _boom(*a, **k):
+        raise AssertionError("no grading in the submit path")
+
+    monkeypatch.setattr(asv, "_grade", _boom)
+
+    # Submit two ungraded answers (no background run yet → both score NULL).
+    asv.grade_answer(s, session_id=sid, transcript="a0")
+    s.commit()
+    asv.grade_answer(s, session_id=sid, transcript="a1")
+    s.commit()
+
+    row = s.get(AssessmentSession, sid)
+    out = asv._summary(s, row, asv.get_questions(s, row.role))     # must not raise
+    assert out["overall_score"] is None                           # nothing graded yet
+    assert out["passed_count"] == 0
+    assert row.completed_at is None                               # not stamped mid-grading
 
 
 def test_summary_is_read_only_when_not_just_graded():

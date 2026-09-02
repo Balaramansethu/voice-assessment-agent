@@ -17,6 +17,7 @@ from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db.models import AssessmentAnswer, AssessmentSession, RoleQuestion
+from app.db.session import session_scope
 from app.observability.tracing import groq_client, traceable
 
 # Client-provided evaluator spec (verbatim). {{question}} and {{candidate_answer}} are
@@ -215,10 +216,23 @@ def _grade(prompt: str, expected: str, key_points: list, answer: str) -> dict:
     return _empty_grade(content[:300])
 
 
-@traceable(run_type="chain", name="assessment.grade_and_advance")
+@traceable(run_type="chain", name="assessment.submit_answer")
 def grade_answer(session: Session, *, session_id: int, transcript: str) -> dict:
-    """Grade the current question's answer (silently) and return the next question,
-    or a final summary when the set is exhausted."""
+    """Fast-submit path (silent grading is OFF the conversation critical path).
+
+    Persist the answer's transcript IMMEDIATELY with score/rating/etc. left NULL
+    (ungraded) and return the next question — or the final "done" response — right away.
+    The actual Groq grading (0.9–4s, reasoning model) runs in the BACKGROUND afterwards
+    via `grade_pending_answer`, which the endpoint schedules through FastAPI
+    BackgroundTasks. Grading is SILENT (recruiter-only), so blocking the candidate on it
+    bought nothing; moving it off-path cuts ~1–4s per question and softens the impact of
+    Groq daily-token throttling on the live flow.
+
+    On a real insert the returned dict carries `_answer_id` (the row to grade) so the
+    endpoint can enqueue the background task; the idempotent no-op paths omit it. The
+    caller (endpoint) strips `_answer_id` before it reaches the agent — it's not part of
+    the tool contract, which is still {next_question} / {done}.
+    """
     s = session.get(AssessmentSession, session_id)
     if s is None:
         return {"ok": False, "message": "Unknown assessment session."}
@@ -234,6 +248,8 @@ def grade_answer(session: Session, *, session_id: int, transcript: str) -> dict:
     # collapsed) to the last stored transcript AND inserted within DUP_WINDOW → treat as a
     # retry. The time window keeps a legitimately-similar answer to a LATER question (given
     # much later) from being swallowed; exact consecutive duplicates are the observed break.
+    # The guard still holds under background grading: the transcript is stored on submit
+    # (before grading), so a retry compares against a row that already exists.
     last = session.scalars(
         select(AssessmentAnswer).where(AssessmentAnswer.session_id == session_id)
         .order_by(AssessmentAnswer.position.desc(), AssessmentAnswer.created_at.desc())
@@ -253,27 +269,107 @@ def grade_answer(session: Session, *, session_id: int, transcript: str) -> dict:
         return _summary(session, s, questions)
 
     q = questions[answered]
-    grade = _grade(q.prompt, q.expected_answer, q.key_points, transcript)
-    session.add(AssessmentAnswer(
+    # Insert UNGRADED: transcript + position now, verdict fields NULL. The background
+    # grader fills score/rating/reason/covered/missed/errors and (once all answers are
+    # graded) stamps the session aggregate. Completion is NOT stamped here — it can only
+    # be correct once every answer has a score.
+    answer = AssessmentAnswer(
         session_id=session_id, question_id=q.id, position=q.position, transcript=transcript,
-        score=grade["score"], rating=grade["rating"], passed=grade["passed"],
-        reason=grade["reason"],
-        required_covered=grade["required_covered"],
-        important_covered=grade["important_covered"],
-        important_missed=grade["important_missed"],
-        optional_missed=grade["optional_missed"],
-        technical_errors=grade["technical_errors"],
-    ))
-    session.flush()
+    )
+    session.add(answer)
+    # Commit the ungraded row NOW so the background grader (its own session_scope, possibly
+    # a different thread) can read it. FastAPI runs BackgroundTasks before the get_session
+    # dependency's own commit fires, so an uncommitted flush would be invisible to the task
+    # and the answer would never get graded. Committing here also keeps the transcript
+    # durable the instant we hand back the next question.
+    session.commit()
 
     next_idx = answered + 1
     if next_idx >= len(questions):
-        return _summary(session, s, questions, just_graded=True)
+        # Final answer: the candidate-facing "that was the last question, thanks" response
+        # returns immediately. The recruiter's /summary shows the full aggregate a moment
+        # later, once background grading stamps completion — partial/NULL before that.
+        return {"ok": True, "done": True, "role": s.role,
+                "candidate_name": s.candidate_name,
+                "total": len(questions), "answered": next_idx,
+                "_answer_id": answer.id}
     nq = questions[next_idx]
     # Score/rating are intentionally NOT returned to the agent for speaking — silent grading.
     return {"ok": True, "done": False,
             "next_question": {"position": nq.position, "prompt": nq.prompt},
-            "progress": f"{next_idx}/{len(questions)}"}
+            "progress": f"{next_idx}/{len(questions)}",
+            "_answer_id": answer.id}
+
+
+@traceable(run_type="chain", name="assessment.grade_pending_answer")
+def grade_pending_answer(answer_id: int) -> None:
+    """Background grader: grade one persisted-but-ungraded answer, then (if this was the
+    last one) stamp the session aggregate. Opens its OWN DB session via `session_scope()`
+    because the request session that inserted the row is already closed by the time
+    FastAPI runs the background task (the response has been sent).
+
+    Idempotent: re-running on an already-graded row (score not NULL) is a no-op, and
+    completion stamping is guarded by `completed_at IS NULL` under a row lock so the last
+    two grades finishing concurrently stamp exactly once.
+
+    CAVEAT (POC, acceptable): if the process dies after the row is committed but before
+    this task grades it, that answer stays ungraded (score NULL) and the session never
+    stamps — BackgroundTasks are in-process, not durable. A tiny reconciliation sweep
+    (grade any NULL-score answers on startup, then stamp any complete-but-unstamped
+    session) would close this; not built here to avoid over-engineering the POC.
+    """
+    with session_scope() as session:
+        answer = session.get(AssessmentAnswer, answer_id)
+        if answer is None or answer.score is not None:
+            return                                     # gone or already graded
+        s = session.get(AssessmentSession, answer.session_id)
+        if s is None:
+            return
+        q = session.get(RoleQuestion, answer.question_id)
+        if q is None:
+            return
+
+        grade = _grade(q.prompt, q.expected_answer, q.key_points, answer.transcript)
+        answer.score = grade["score"]
+        answer.rating = grade["rating"]
+        answer.passed = grade["passed"]
+        answer.reason = grade["reason"]
+        answer.required_covered = grade["required_covered"]
+        answer.important_covered = grade["important_covered"]
+        answer.important_missed = grade["important_missed"]
+        answer.optional_missed = grade["optional_missed"]
+        answer.technical_errors = grade["technical_errors"]
+        session.flush()
+
+        _maybe_stamp_completion(session, s)
+
+
+def _maybe_stamp_completion(session: Session, s: AssessmentSession) -> None:
+    """Stamp the session aggregate exactly once, when every answer is graded.
+
+    Called from the background grader after each answer is scored. Row-locks the session
+    (`SELECT ... FOR UPDATE`) and re-checks `completed_at IS NULL` so that when the last
+    two grades finish concurrently, only one transaction stamps — the other blocks on the
+    lock, then sees `completed_at` already set and returns. Uses `_summary(..., just_graded=
+    True)`, the single scoring path, so the SAME 0..10 aggregate is written as before.
+    """
+    locked = session.scalars(
+        select(AssessmentSession).where(AssessmentSession.id == s.id).with_for_update()
+    ).first()
+    if locked is None or locked.completed_at is not None:
+        return
+    questions = get_questions(session, locked.role)
+    # Any ungraded answer left? Then it isn't complete yet.
+    ungraded = session.scalar(
+        select(func.count(AssessmentAnswer.id)).where(
+            AssessmentAnswer.session_id == locked.id, AssessmentAnswer.score.is_(None))
+    ) or 0
+    answered = session.scalar(
+        select(func.count(AssessmentAnswer.id)).where(AssessmentAnswer.session_id == locked.id)
+    ) or 0
+    if ungraded > 0 or answered < len(questions):
+        return
+    _summary(session, locked, questions, just_graded=True)
 
 
 def _summary(session: Session, s: AssessmentSession, questions: list,

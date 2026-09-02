@@ -1,7 +1,7 @@
 """Assessment endpoints — role-based quiz with live, silent, graded validation."""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, BackgroundTasks, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -41,9 +41,21 @@ def start(body: StartRequest, session: Session = Depends(get_session)) -> dict:
 
 
 @router.post("/grade")
-def grade(body: GradeRequest, session: Session = Depends(get_session)) -> dict:
-    """Grade the current answer silently and return the next question or the summary."""
-    return asv.grade_answer(session, session_id=body.session_id, transcript=body.transcript)
+def grade(body: GradeRequest, background_tasks: BackgroundTasks,
+          session: Session = Depends(get_session)) -> dict:
+    """Submit the current answer and return the next question (or the done response)
+    IMMEDIATELY. Silent grading is SCHEDULED to run in the background after the response
+    is sent — it's recruiter-only, so it has no business on the conversation critical path.
+
+    The sync endpoint runs in FastAPI's threadpool; BackgroundTasks fire after the
+    response, and `grade_pending_answer` opens its own DB session (this request's session
+    is closed by then). `_answer_id` is an internal handle — stripped before the response
+    so the agent tool contract stays {next_question} / {done}."""
+    result = asv.grade_answer(session, session_id=body.session_id, transcript=body.transcript)
+    answer_id = result.pop("_answer_id", None)
+    if answer_id is not None:
+        background_tasks.add_task(asv.grade_pending_answer, answer_id)
+    return result
 
 
 @router.get("/by_call")
