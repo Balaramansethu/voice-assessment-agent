@@ -17,11 +17,13 @@ the new interview — that's the whole demo loop.
 from __future__ import annotations
 
 import os
+import re
 import time
 
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import Frame, LLMRunFrame, TextFrame
@@ -108,6 +110,54 @@ class SpeakableTextFilter(FrameProcessor):
         # LLMTextFrame subclasses TextFrame; matching TextFrame covers both.
         if isinstance(frame, TextFrame) and not any(c.isalnum() for c in frame.text):
             return  # nothing to say — drop it before it reaches TTS
+        await self.push_frame(frame, direction)
+
+
+# --- numeronym / abbreviation → spoken-word normalization ----------------------
+# Deepgram Aura reads raw text and mangles numeronyms ("a11y" → "a eleven y"), and
+# Aura's Settings expose no SSML/normalization, so Deepgram's own guidance is to fix
+# this at the TEXT layer. We map the known offenders to their spoken form and rewrite
+# them on the TextFrame BEFORE TTS. Genuine acronyms that already read correctly
+# (API, CSS, HTML, DOM, ARIA, CDN, SPA) are deliberately absent and left untouched.
+_SPOKEN_FORMS: dict[str, str] = {
+    "a11y": "accessibility",
+    "i18n": "internationalization",
+    "l10n": "localization",
+    "k8s": "kubernetes",
+    "e2e": "end to end",
+    "p11y": "performance",
+    "o11y": "observability",
+    "s12n": "serialization",
+}
+_NUMERONYM_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in sorted(_SPOKEN_FORMS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def _speakify(text: str) -> str:
+    """Replace known numeronyms/abbreviations with their spoken-word form.
+
+    Whole-word and case-insensitive; unknown tokens and normal acronyms are left
+    exactly as-is. Pure — safe to unit-test in isolation.
+    """
+    return _NUMERONYM_RE.sub(lambda m: _SPOKEN_FORMS[m.group(0).lower()], text)
+
+
+class SpokenFormNormalizer(FrameProcessor):
+    """Rewrites numeronyms/abbreviations to spoken words on their way to TTS.
+
+    Sits in the llm→tts slot and mutates the text of every TextFrame in place
+    (LLMTextFrame subclasses TextFrame, so streamed LLM output is covered too).
+    Only the known map is touched; everything else passes through unchanged.
+    """
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        await super().process_frame(frame, direction)
+        if isinstance(frame, TextFrame):
+            new_text = _speakify(frame.text)
+            if new_text != frame.text:
+                frame.text = new_text
         await self.push_frame(frame, direction)
 
 
@@ -230,7 +280,8 @@ async def bot(runner_args: RunnerArguments) -> None:
     # backfills the framework default, which is itself Smart Turn v3. So `vad` has to
     # name SpeechTimeoutUserTurnStopStrategy to genuinely opt out of the model.
     turn_detection = os.getenv("TURN_DETECTION", "smart_turn").strip().lower()
-    smart_turn_cpus = int(os.getenv("SMART_TURN_CPU_COUNT", "1"))
+    smart_turn_cpus = int(os.getenv("SMART_TURN_CPU_COUNT", "2"))
+    smart_turn_stop_secs = float(os.getenv("SMART_TURN_STOP_SECS", "1.0"))
     if turn_detection == "smart_turn":
         # The stop strategy is self-driving: it consumes the InputAudioRawFrame /
         # VAD / transcription frames already flowing through the user aggregator,
@@ -239,7 +290,16 @@ async def bot(runner_args: RunnerArguments) -> None:
         # keeps us on the cascade (STT) path: fire on COMPLETE *and* a finalized
         # transcript, so we never cut a turn before Deepgram has the words.
         stop_strategy: BaseUserTurnStopStrategy = TurnAnalyzerUserTurnStopStrategy(
-            turn_analyzer=LocalSmartTurnAnalyzerV3(cpu_count=smart_turn_cpus),
+            turn_analyzer=LocalSmartTurnAnalyzerV3(
+                cpu_count=smart_turn_cpus,
+                # Tighten the hard-silence backstop 3.0s → 1.0s so an unsure model
+                # doesn't make the caller wait; it still fires fast when confident.
+                params=SmartTurnParams(
+                    stop_secs=smart_turn_stop_secs,
+                    pre_speech_ms=500,
+                    max_duration_secs=8,
+                ),
+            ),
             wait_for_transcript=True,
         )
     else:
@@ -330,8 +390,9 @@ async def bot(runner_args: RunnerArguments) -> None:
         transport.input(),
         vad,           # sole turn detector → emits VAD speaking frames for the aggregator
         stt,           # Deepgram transcribes only (endpointing disabled)
-        user_agg,
+        user_agg,      # Smart Turn gates end-of-turn here
         llm,
+        SpokenFormNormalizer(),  # a11y → accessibility, k8s → kubernetes, … before TTS
         SpeakableTextFilter(),   # drop punctuation-only fragments before TTS
         tts,
         transport.output(),

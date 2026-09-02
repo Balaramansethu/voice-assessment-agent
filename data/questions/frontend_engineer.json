@@ -26,7 +26,7 @@
       "difficulty": "medium"
     },
     {
-      "prompt": "How do you make a web application accessible (a11y)?",
+      "prompt": "How do you make a web application accessible?",
       "expected_answer": "Use semantic HTML, provide text alternatives for images, ensure keyboard navigability and visible focus, use ARIA only when semantics are insufficient, maintain sufficient color contrast, label form controls, and test with screen readers and automated tools like axe.",
       "key_points": [
         "Semantic HTML first",

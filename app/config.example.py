@@ -42,7 +42,12 @@ class Settings(BaseSettings):
     #                and the analyzer's own 3s silence backstop guarantees a turn ends).
     #   vad        — fall back to crude fixed-silence VAD endpointing (offline/low-CPU).
     turn_detection: str = "smart_turn"          # smart_turn | vad
-    smart_turn_cpu_count: int = 1               # ONNX inference threads for Smart Turn
+    smart_turn_cpu_count: int = 2               # ONNX inference threads for Smart Turn
+    # Hard-silence backstop inside the Smart Turn analyzer: when the prosody model
+    # never says COMPLETE (an unsure turn), the turn is forced closed after this many
+    # seconds of silence. Analyzer default is 3.0s; ~1s means an unsure caller waits
+    # ~1s, not 3, before their turn ends. VAD stop_secs (0.2) is only the onset trigger.
+    smart_turn_stop_secs: float = 1.0
 
     # offline fallback (optional)
     ollama_base_url: str = "http://ollama:11434/v1"
