@@ -121,6 +121,46 @@ def start_session(session: Session, role: str, *, candidate_name: str | None = N
             "first_question": {"position": questions[0].position, "prompt": questions[0].prompt}}
 
 
+# A retried tool cycle fires within seconds; a genuinely similar-but-later answer arrives
+# after the candidate has heard and answered the next question. 30s comfortably separates
+# the two while still catching the storm-driven retry.
+_DUP_WINDOW_SECONDS = 30.0
+
+
+def _normalize(text: str) -> str:
+    """Case-insensitive, whitespace-collapsed form used for duplicate detection."""
+    return re.sub(r"\s+", " ", (text or "").strip()).lower()
+
+
+def _within_dup_window(last: AssessmentAnswer) -> bool:
+    """True if `last` was inserted recently enough to treat a matching resend as a retry.
+    created_at may be naive (server default) or tz-aware depending on the driver — coerce
+    to UTC before subtracting so the comparison never raises."""
+    ts = last.created_at
+    if ts is None:
+        return True
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - ts).total_seconds() <= _DUP_WINDOW_SECONDS
+
+
+def _pending(session: Session, s: AssessmentSession, questions: list) -> dict:
+    """Idempotent 'where are we now' answer: the next unanswered question, or the
+    summary if the set is exhausted. Never inserts or advances — used by the
+    duplicate-submit and empty-transcript guards so a retry re-hands the correct
+    next step instead of corrupting positions. Shape mirrors grade_answer's success
+    returns so the agent can't tell a no-op retry from the original call."""
+    answered = session.scalar(
+        select(func.count(AssessmentAnswer.id)).where(AssessmentAnswer.session_id == s.id)
+    ) or 0
+    if answered >= len(questions):
+        return _summary(session, s, questions)          # read-only: not just_graded
+    nq = questions[answered]
+    return {"ok": True, "done": False,
+            "next_question": {"position": nq.position, "prompt": nq.prompt},
+            "progress": f"{answered}/{len(questions)}"}
+
+
 def _empty_grade(reason: str = "") -> dict:
     """Fallback grade when the model returns no parseable JSON."""
     return {"score": None, "rating": None, "passed": None, "reason": reason,
@@ -183,6 +223,28 @@ def grade_answer(session: Session, *, session_id: int, transcript: str) -> dict:
     if s is None:
         return {"ok": False, "message": "Unknown assessment session."}
     questions = get_questions(session, s.role)
+
+    # Idempotency guard (defense-in-depth). A cancelled/retried LLM tool cycle can call
+    # submit_answer twice with the SAME transcript; because position is derived by counting
+    # rows, a naive second insert would land on the NEXT question and shift every later
+    # answer (prod session 28). This is Postgres-as-idempotency, same spirit as
+    # call.provider_call_id UNIQUE + ON CONFLICT DO NOTHING. The tool only sends {answer},
+    # so there's no client token to dedupe on — we compare the normalized transcript against
+    # the most-recently-inserted answer. Predicate: identical (case-insensitive, whitespace-
+    # collapsed) to the last stored transcript AND inserted within DUP_WINDOW → treat as a
+    # retry. The time window keeps a legitimately-similar answer to a LATER question (given
+    # much later) from being swallowed; exact consecutive duplicates are the observed break.
+    last = session.scalars(
+        select(AssessmentAnswer).where(AssessmentAnswer.session_id == session_id)
+        .order_by(AssessmentAnswer.position.desc(), AssessmentAnswer.created_at.desc())
+        .limit(1)
+    ).first()
+    incoming = _normalize(transcript)
+    # Blank/spurious turn: never insert or advance, just re-hand the pending question.
+    if not incoming:
+        return _pending(session, s, questions)
+    if last is not None and _normalize(last.transcript) == incoming and _within_dup_window(last):
+        return _pending(session, s, questions)
 
     answered = session.scalar(
         select(func.count(AssessmentAnswer.id)).where(AssessmentAnswer.session_id == session_id)
