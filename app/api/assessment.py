@@ -46,6 +46,49 @@ def grade(body: GradeRequest, session: Session = Depends(get_session)) -> dict:
     return asv.grade_answer(session, session_id=body.session_id, transcript=body.transcript)
 
 
+@router.get("/by_call")
+def by_call(provider_call_id: str, session: Session = Depends(get_session)) -> dict:
+    """Resolve the assessment session opened against a given provider_call_id.
+
+    Read-only, transition-free. The offline self-test harness opens a call with a unique
+    provider_call_id, then needs the session id the agent bound server-side (which it
+    never exposes). We map provider_call_id → Call.id → the newest AssessmentSession on
+    that call. General-purpose recruiter-side lookup too (call recording ↔ result)."""
+    from sqlalchemy import select
+    from app.db.models import AssessmentSession, Call
+    call_id = session.scalar(select(Call.id).where(Call.provider_call_id == provider_call_id))
+    if call_id is None:
+        return {"ok": False, "session_id": None, "message": "Unknown call."}
+    sid = session.scalar(
+        select(AssessmentSession.id).where(AssessmentSession.call_id == call_id)
+        .order_by(AssessmentSession.id.desc()).limit(1)
+    )
+    return {"ok": sid is not None, "session_id": sid, "call_id": call_id}
+
+
+@router.get("/{session_id}/answers")
+def answers(session_id: int, session: Session = Depends(get_session)) -> dict:
+    """Raw persisted answers for a session (position + transcript + score/rating).
+
+    Read-only, transition-free. Exposed so the offline self-test harness — which runs
+    in the agent container and has no DB driver — can assert answer ALIGNMENT
+    (5 answers, positions 1..5, transcripts 1:1) over HTTP. Transcripts are the
+    candidate's own spoken words, not grading output, so this reveals no silent verdict
+    the agent shouldn't see (scores are already returned by /summary for the recruiter)."""
+    from sqlalchemy import select
+    from app.db.models import AssessmentAnswer, AssessmentSession
+    s = session.get(AssessmentSession, session_id)
+    if s is None:
+        return {"ok": False, "message": "Unknown session."}
+    rows = session.scalars(
+        select(AssessmentAnswer).where(AssessmentAnswer.session_id == session_id)
+        .order_by(AssessmentAnswer.position)
+    ).all()
+    return {"ok": True, "session_id": session_id,
+            "answers": [{"position": r.position, "transcript": r.transcript,
+                         "score": r.score, "rating": r.rating} for r in rows]}
+
+
 @router.get("/{session_id}/summary")
 def summary(session_id: int, session: Session = Depends(get_session)) -> dict:
     from app.db.models import AssessmentSession

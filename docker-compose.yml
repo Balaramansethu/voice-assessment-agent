@@ -48,6 +48,7 @@ services:
       API_BASE: http://api:8000
     volumes:
       - ./app:/app/app                 # live-edit the bot without a rebuild
+      - ./scripts:/app/scripts         # run scripts/selftest.py against the real pipeline
       - kokoro_models:/root/.cache     # cache the downloaded Kokoro model
     ports:
       - "7860:7860"

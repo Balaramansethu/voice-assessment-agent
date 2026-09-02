@@ -208,9 +208,25 @@ def _transport_params() -> dict:
     }
 
 
-async def bot(runner_args: RunnerArguments) -> None:
-    transport = await create_transport(runner_args, _transport_params())
+async def build_interview_task(
+    head: FrameProcessor,
+    tail: FrameProcessor,
+    *,
+    handle_sigint: bool = False,
+):
+    """Assemble the REAL interview pipeline between a supplied `head` and `tail`.
 
+    Everything that defines the agent's behaviour — Deepgram Nova-3 STT, the Silero
+    VADProcessor, Smart Turn v3 end-of-turn, the qwen LLM + the three tools, Deepgram
+    Aura TTS, the SpokenFormNormalizer / SpeakableTextFilter, and the min-words
+    barge-in strategy — is built here exactly once. `bot()` (WebRTC/Twilio) passes
+    `transport.input()` / `transport.output()`; the offline self-test harness passes a
+    scripted audio source / capturing sink. Neither forks the pipeline logic.
+
+    Returns `(task, greet)`: the assembled `PipelineTask` and an async `greet()` that
+    seeds the greeting kickoff turn (what `on_client_connected` fires for a live call).
+    The caller owns the run loop and, for the transport case, the event wiring.
+    """
     groq_key = os.environ["GROQ_API_KEY"]
     deepgram_key = os.environ["DEEPGRAM_API_KEY"]
     # Deepgram Nova-3 streaming STT. ONE turn-taking authority only: the Silero
@@ -441,7 +457,7 @@ async def bot(runner_args: RunnerArguments) -> None:
     )
 
     pipeline = Pipeline([
-        transport.input(),
+        head,          # transport.input() (live) or a scripted audio source (self-test)
         vad,           # sole turn detector → emits VAD speaking frames for the aggregator
         stt,           # Deepgram transcribes only (endpointing disabled)
         user_agg,      # Smart Turn gates end-of-turn here
@@ -449,16 +465,15 @@ async def bot(runner_args: RunnerArguments) -> None:
         SpokenFormNormalizer(),  # a11y → accessibility, k8s → kubernetes, … before TTS
         SpeakableTextFilter(),   # drop punctuation-only fragments before TTS
         tts,
-        transport.output(),
+        tail,          # transport.output() (live) or a capturing sink (self-test)
         assistant_agg,
     ])
     task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
 
-    @transport.event_handler("on_client_connected")
-    async def _on_connected(_transport, _client):
+    async def greet(*, provider_call_id: str, from_number: str, transport_kind: str) -> None:
         # Create a call record for tracing; the agent then greets and asks which role.
-        info = await tools.open_inbound(provider_call_id=f"WEB{int(time.time()*1000)}",
-                                        from_number="browser-webrtc", transport="webrtc")
+        info = await tools.open_inbound(provider_call_id=provider_call_id,
+                                        from_number=from_number, transport=transport_kind)
         state["call_id"] = info.get("call_id")
 
         # The greeting kickoff must be a USER message, not a system one: qwen's chat
@@ -474,6 +489,21 @@ async def bot(runner_args: RunnerArguments) -> None:
              "yet — wait for me to give my name and role."},
         ])
         await task.queue_frames([LLMRunFrame()])
+
+    return task, greet
+
+
+async def bot(runner_args: RunnerArguments) -> None:
+    transport = await create_transport(runner_args, _transport_params())
+    task, greet = await build_interview_task(
+        transport.input(), transport.output(),
+        handle_sigint=getattr(runner_args, "handle_sigint", False),
+    )
+
+    @transport.event_handler("on_client_connected")
+    async def _on_connected(_transport, _client):
+        await greet(provider_call_id=f"WEB{int(time.time()*1000)}",
+                    from_number="browser-webrtc", transport_kind="webrtc")
 
     runner = PipelineRunner(handle_sigint=getattr(runner_args, "handle_sigint", False))
     await runner.run(task)
