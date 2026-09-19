@@ -34,6 +34,11 @@ RUN pip install --no-cache-dir \
 RUN python -m nltk.downloader -d /root/nltk_data punkt_tab punkt
 
 COPY app ./app
+# Defensive only: neither app/agent/pipeline.py nor app/agent/tools.py currently
+# imports app.config/settings (both read config via os.getenv directly), so a missing
+# app/config.py cannot crash this image today. Added for consistency with the api
+# image and to future-proof against the agent someday importing app.config.
+RUN test -f app/config.py || cp app/config.example.py app/config.py
 COPY web ./web
 
 EXPOSE 7860

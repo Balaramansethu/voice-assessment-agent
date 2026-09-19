@@ -1,0 +1,28 @@
+# Secrets — never enter the build context.
+.env
+
+# VCS + agent-session artifacts.
+.git
+.github
+.claude/worktrees
+.codex
+.openai
+
+# Host-specific operational runbook (SSH/credential specifics); gitignored, never bake in.
+RUNBOOK.local.md
+*.local.md
+
+# Caches / bytecode.
+__pycache__
+**/__pycache__/
+*.pyc
+.pytest_cache
+.venv
+venv
+
+# Local scratch output, not needed to run the app.
+graphify-out
+.DS_Store
+
+# Mounted at runtime via docker-compose volumes, not baked into the image.
+data
