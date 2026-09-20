@@ -1,6 +1,7 @@
 # Core app image (FastAPI control plane). Pinned to 3.12 — host Python 3.14 has
 # no wheels yet for several deps; the container never uses the host interpreter.
-FROM python:3.12-slim
+# Base image pinned to exact digest for reproducibility (PR-607).
+FROM python:3.12-slim@sha256:7a8b475003c4fe15a2cd4e55e5cfc2f3560bdc9333d624f24cdd6d4340fd7a17
 
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app

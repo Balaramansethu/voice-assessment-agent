@@ -26,3 +26,6 @@ graphify-out
 
 # Mounted at runtime via docker-compose volumes, not baked into the image.
 data
+
+# Local backups (never bake into image; PR-609)
+backups

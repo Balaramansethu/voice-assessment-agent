@@ -14,3 +14,6 @@ app/config.py
 RUNBOOK.local.md
 # local Claude Code settings (keep project agents/ tracked)
 .claude/settings.local.json
+
+# backup dumps (never commit; PR-609)
+backups/
