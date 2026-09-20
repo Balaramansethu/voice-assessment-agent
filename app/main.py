@@ -6,7 +6,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -14,7 +14,7 @@ from app.api import (
     assessment, calls, candidates, health, interviews, observability, rag, scenarios,
     telephony,
 )
-from app.config import settings
+from app.config import settings, validate_production_config
 from app.db.session import init_db
 # Importing tracing configures LangSmith env from settings (no-op without a key).
 from app.observability.tracing import TRACING_ENABLED, trace
@@ -24,6 +24,7 @@ WEB_DIR = Path(__file__).resolve().parent.parent / "web"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    validate_production_config(settings)
     init_db()
     yield
 
@@ -50,8 +51,16 @@ async def _langsmith_request_trace(request: Request, call_next):
             pass
         return response
 
+
+def _production_lockout():
+    """Per-request gate (not import-time) — settings.app_env is read fresh on every
+    call, so a live-mutated settings object is observed immediately with no reload."""
+    if settings.app_env.strip().lower() == "production":
+        raise HTTPException(status_code=404)
+
+
 app.include_router(health.router)
-app.include_router(scenarios.router)
+app.include_router(scenarios.router, dependencies=[Depends(_production_lockout)])
 app.include_router(candidates.router)
 app.include_router(interviews.router)
 app.include_router(calls.router)

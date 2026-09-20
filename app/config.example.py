@@ -67,6 +67,23 @@ class Settings(BaseSettings):
     twilio_phone_number: str = ""
     public_host: str = ""           # public domain (for Twilio signature validation)
 
+    # PR-105 — scope shared-secret keys (rotate independently per scope in production)
+    agent_shared_key: str = "dev-agent-key-change-me"
+    recruiter_shared_key: str = "dev-recruiter-key-change-me"
+    worker_shared_key: str = "dev-worker-key-change-me"
+    ops_shared_key: str = "dev-ops-key-change-me"
+
+    # PR-021 — public voice-entry hardening: token TTL, concurrency ceiling,
+    # per-number rate limit, max call duration. Postgres/application-enforced,
+    # no new infra. max_call_duration_seconds is also read directly via
+    # os.getenv() in app/agent/pipeline.py (the agent process doesn't import
+    # app.config — see Dockerfile.agent) — same pattern as TURN_DETECTION /
+    # SMART_TURN_STOP_SECS / INTERRUPTION_MIN_WORDS elsewhere in this file.
+    voice_session_token_ttl_seconds: int = 30
+    max_concurrent_calls: int = 5
+    max_calls_per_number_per_minute: int = 3
+    max_call_duration_seconds: int = 900
+
     # interview config
     interview_expiry_hours: int = 72
 
@@ -76,6 +93,14 @@ class Settings(BaseSettings):
     langsmith_api_key: str = ""
     langsmith_project: str = "observability"
     langsmith_endpoint: str = "https://api.smith.langchain.com"
+    # Opt-in, production-only: capture full trace payloads (transcripts, candidate
+    # answers, rubric text) in LangSmith. Defaults False — in production, tracing
+    # still records step names/latency/status, but PII/content-shaped fields are
+    # redacted (see app/observability/tracing.py) unless this is explicitly set true.
+    # Outside production this flag has no effect — full capture is the existing,
+    # unchanged dev-debugging behavior. WARNING: true in production sends unredacted
+    # candidate content to a third party (LangSmith).
+    langsmith_capture_content: bool = False
 
     # RAG / retrieval
     embedding_provider: str = "fastembed"          # fastembed | (future: ollama, hosted)
@@ -88,3 +113,86 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+
+class ConfigurationError(RuntimeError):
+    """Raised at server startup when production config carries a placeholder/dev
+    default. Never raised outside app_env == 'production'."""
+
+
+_DEV_DB_USER = "interview"
+_DEV_DB_PASSWORD = "interview"
+
+
+def validate_production_config(s: Settings) -> None:
+    """Fail closed: refuse to start in production with placeholder secrets or the
+    committed dev-default database credentials. No-op outside production.
+
+    Called from app/main.py's lifespan, BEFORE init_db() — this is a server-startup
+    gate that reads settings.app_env at call time, not at module-import time, so
+    scripts/tests that merely import `settings` are unaffected even if APP_ENV
+    happens to be 'production' in their environment.
+    """
+    if s.app_env.strip().lower() != "production":
+        return
+
+    errors: list[str] = []
+
+    _dev_scope_defaults = {
+        "AGENT_SHARED_KEY": ("agent_shared_key", "dev-agent-key-change-me"),
+        "RECRUITER_SHARED_KEY": ("recruiter_shared_key", "dev-recruiter-key-change-me"),
+        "WORKER_SHARED_KEY": ("worker_shared_key", "dev-worker-key-change-me"),
+        "OPS_SHARED_KEY": ("ops_shared_key", "dev-ops-key-change-me"),
+    }
+    seen_scope_values: set[str] = set()
+    for env_name, (attr, dev_default) in _dev_scope_defaults.items():
+        value = getattr(s, attr)
+        if not value.strip():
+            errors.append(f"{env_name} must be set in production.")
+        elif value == dev_default:
+            errors.append(f"{env_name} still uses its committed dev-default value.")
+        elif value in seen_scope_values:
+            errors.append(f"{env_name} must not reuse another scope's secret value.")
+        seen_scope_values.add(value)
+
+    try:
+        from sqlalchemy.engine import make_url
+        url = make_url(s.database_url)
+        if not (url.username or "").strip() or not (url.password or "").strip():
+            errors.append("DATABASE_URL is missing a username or password.")
+        elif url.username == _DEV_DB_USER and url.password == _DEV_DB_PASSWORD:
+            errors.append(
+                "DATABASE_URL still uses the committed dev-default credentials "
+                "(username/password 'interview') — set a production DATABASE_URL "
+                "with real, rotated credentials, regardless of host."
+            )
+    except Exception:
+        errors.append("DATABASE_URL is not a valid database URL.")
+
+    if s.llm_provider == "groq" and not s.groq_api_key:
+        errors.append("LLM_PROVIDER=groq requires GROQ_API_KEY to be set.")
+    if (s.stt_provider == "deepgram" or s.tts_provider == "deepgram") and not s.deepgram_api_key:
+        errors.append(
+            "STT_PROVIDER or TTS_PROVIDER is deepgram, which requires "
+            "DEEPGRAM_API_KEY to be set."
+        )
+    if s.transport_provider == "twilio":
+        missing = [
+            name for name, value in (
+                ("TWILIO_ACCOUNT_SID", s.twilio_account_sid),
+                ("TWILIO_AUTH_TOKEN", s.twilio_auth_token),
+                ("TWILIO_PHONE_NUMBER", s.twilio_phone_number),
+                ("PUBLIC_HOST", s.public_host),
+            )
+            if not value
+        ]
+        if missing:
+            errors.append(
+                "TRANSPORT_PROVIDER=twilio requires " + ", ".join(missing) + " to be set."
+            )
+
+    if errors:
+        raise ConfigurationError(
+            "Refusing to start in production with unsafe configuration:\n- "
+            + "\n- ".join(errors)
+        )
