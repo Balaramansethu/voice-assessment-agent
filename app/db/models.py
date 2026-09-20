@@ -301,6 +301,10 @@ class AssessmentAnswer(Base):
     important_missed: Mapped[list | None] = mapped_column(JSONB)
     optional_missed: Mapped[list | None] = mapped_column(JSONB)
     technical_errors: Mapped[list | None] = mapped_column(JSONB)
+    # PR-503: grading versions persisted durably on the answer (not just the transient GradingJob row).
+    prompt_version: Mapped[str | None] = mapped_column(String(20))
+    model_version: Mapped[str | None] = mapped_column(String(64))
+    rubric_version: Mapped[str | None] = mapped_column(String(20))
     # Legacy columns from the old 0..1 verdict grader; retained for rows graded before
     # the 0..10 rubric so historical data still reads. Not written by the new grader.
     verdict: Mapped[str | None] = mapped_column(String(20))
