@@ -238,7 +238,7 @@ async def _run_pipeline(obs: CaptureObserver, source: ScriptedAudioSource,
     finishes it queues an EndFrame so the runner returns and the process can exit.
     """
     sink = CapturingSink()
-    task, greet = await build_interview_task(source, sink)
+    task, greet, last_activity = await build_interview_task(source, sink)
     # build_interview_task constructs the task with PipelineParams defaults
     # (audio_in_sample_rate=16000, audio_out_sample_rate=24000), which already match our
     # synthesized 16 kHz input — no param override needed.
@@ -266,8 +266,13 @@ async def _run_pipeline(obs: CaptureObserver, source: ScriptedAudioSource,
         #    for the greeting deadline) begins the instant greet() fires — after audio
         #    synthesis, so synthesis time never counts against the 3 s greeting budget.
         obs.mark_session_start()
+        # Must match a seeded candidate's phone (same fallback bot() uses for the WebRTC
+        # demo path) — since P1's invitation-code identity work, any unrecognized
+        # from_number now gets challenged for an invitation code instead of greeted
+        # directly, and this synthetic candidate never speaks one.
+        demo_phone = os.getenv("DEMO_CALLER_PHONE", "+919000000001")
         await greet(provider_call_id=provider_call_id,
-                    from_number="selftest", transport_kind="webrtc")
+                    from_number=demo_phone, transport_kind="webrtc")
         log("Greeting kickoff queued; waiting for greeting TTS …")
         await _wait_for_reply(after_count=0, timeout=GREETING_DEADLINE_S + 5)
 

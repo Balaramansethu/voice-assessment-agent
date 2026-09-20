@@ -16,6 +16,7 @@ the new interview — that's the whole demo loop.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -26,7 +27,12 @@ from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnal
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
-from pipecat.frames.frames import Frame, LLMRunFrame, TextFrame
+from pipecat.frames.frames import (
+    Frame, LLMRunFrame, TextFrame, UserStoppedSpeakingFrame, TTSStartedFrame,
+)
+from pipecat.observers.base_observer import BaseObserver, FramePushed
+from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
+from pipecat.observers.loggers.metrics_log_observer import MetricsLogObserver
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
@@ -53,7 +59,7 @@ from pipecat.turns.user_stop.turn_analyzer_user_turn_stop_strategy import (
     TurnAnalyzerUserTurnStopStrategy,
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
-from pipecat.runner.types import RunnerArguments
+from pipecat.runner.types import RunnerArguments, WebSocketRunnerArguments
 from pipecat.runner.utils import create_transport
 from pipecat.services.deepgram.stt import DeepgramSTTService
 from pipecat.services.deepgram.tts import DeepgramTTSService
@@ -96,10 +102,29 @@ KB_ANSWER_SCHEMA = FunctionSchema(
     required=["query"],
 )
 
+VERIFY_INVITATION_SCHEMA = FunctionSchema(
+    name="verify_invitation_code",
+    description="Verify the caller's identity using the invitation/interview code from "
+                "their interview confirmation email or SMS. Call this ONLY when told the "
+                "caller's identity is not yet established.",
+    properties={"code": {"type": "string", "description": "The code the caller read out."}},
+    required=["code"],
+)
+
 
 # Matches a fragment made up solely of dots/ellipses (e.g. "..", "...", "…", ". . .").
 # A single "." is intentionally NOT caught here — see _is_unspeakable.
 _DOTS_ONLY_RE = re.compile(r"^[.…]+$")
+
+# secrets.token_urlsafe(32) always produces exactly 43 chars from this fixed
+# charset (base64url, no padding, 32 random bytes -> ceil(256/6)=43 chars).
+# Anything else is obviously garbage — reject with ZERO network/DB round-trip,
+# before ever calling the api service. This doesn't stop a connection flood by
+# itself (raw .accept() still happens at the TCP/WS-upgrade level, which is
+# why a Caddy access-log + fail2ban layer exists — see deploy/Caddyfile and
+# RUNBOOK.local.md) — it makes each rejected garbage connection nearly free
+# instead of costing a Postgres write via consume_token.
+_TOKEN_SHAPE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 
 
 def _is_unspeakable(text: str) -> bool:
@@ -189,6 +214,22 @@ class SpokenFormNormalizer(FrameProcessor):
         await self.push_frame(frame, direction)
 
 
+class ActivityObserver(BaseObserver):
+    """PR-407: updates last_activity['t'] on any user-speech-stop or bot-speech-start
+    frame, so an inactivity watchdog can detect a caller who goes silent without hanging
+    up — which would otherwise hold a max_concurrent_calls slot for the full
+    max_call_duration_seconds. Passive observer (task.add_observer), not a pipeline
+    FrameProcessor — does not touch the existing turn-detection chain."""
+
+    def __init__(self, last_activity: dict) -> None:
+        super().__init__()
+        self._last_activity = last_activity
+
+    async def on_push_frame(self, data: FramePushed) -> None:
+        if isinstance(data.frame, (UserStoppedSpeakingFrame, TTSStartedFrame)):
+            self._last_activity["t"] = time.monotonic()
+
+
 def _transport_params() -> dict:
     return {
         # Browser: plain WebRTC in/out. Deepgram handles quiet mic audio natively,
@@ -223,9 +264,10 @@ async def build_interview_task(
     `transport.input()` / `transport.output()`; the offline self-test harness passes a
     scripted audio source / capturing sink. Neither forks the pipeline logic.
 
-    Returns `(task, greet)`: the assembled `PipelineTask` and an async `greet()` that
-    seeds the greeting kickoff turn (what `on_client_connected` fires for a live call).
-    The caller owns the run loop and, for the transport case, the event wiring.
+    Returns `(task, greet, last_activity)`: the assembled `PipelineTask`, an async `greet()`
+    that seeds the greeting kickoff turn (what `on_client_connected` fires for a live call),
+    and a dict used by the inactivity watchdog to track activity timestamps. The caller owns
+    the run loop and, for the transport case, the event wiring.
     """
     groq_key = os.environ["GROQ_API_KEY"]
     deepgram_key = os.environ["DEEPGRAM_API_KEY"]
@@ -382,7 +424,8 @@ async def build_interview_task(
     )
 
     # Per-connection binding, set once the assessment starts.
-    state = {"session_id": None, "call_id": None, "role": None}
+    state = {"session_id": None, "call_id": None, "role": None, "candidate_id": None,
+             "interview_id": None}
 
     async def _start_assessment(params: FunctionCallParams) -> None:
         res = await tools.start_assessment(
@@ -410,7 +453,8 @@ async def build_interview_task(
             await params.result_callback({"instruction":
                 "No assessment started yet — ask which role they're interviewing for."})
             return
-        res = await tools.submit_answer(session_id=sid, transcript=params.arguments["answer"])
+        res = await tools.submit_answer(session_id=sid, call_id=state["call_id"],
+                                        transcript=params.arguments["answer"])
         if res.get("done"):
             await params.result_callback({"done": True, "instruction":
                 "That was the last question. Thank them warmly for their time, tell them the "
@@ -436,14 +480,34 @@ async def build_interview_task(
                 "Read this answer to the caller conversationally, then continue the assessment "
                 "from where you left off (re-ask the current question if needed)."})
 
+    async def _verify_invitation_code(params: FunctionCallParams) -> None:
+        res = await tools.verify_invitation_code(call_id=state["call_id"],
+                                                 code=params.arguments["code"])
+        if res.get("resolved"):
+            state["candidate_id"] = res["candidate"]["id"]
+            state["interview_id"] = (res.get("interview") or {}).get("id")
+            await params.result_callback({"ok": True, "instruction":
+                f"Identity verified as {res['candidate']['name']}. Greet them by name, then ask "
+                "which role they're interviewing for."})
+        elif res.get("locked"):
+            await params.result_callback({"ok": False, "instruction":
+                "Too many attempts. Apologize briefly and say you're connecting them with "
+                "recruiting. Do NOT ask for the code again."})
+        else:
+            await params.result_callback({"ok": False, "instruction":
+                "That code wasn't recognized. Ask them to repeat it carefully, or offer to "
+                "connect them with recruiting."})
+
     llm.register_function("start_assessment", _start_assessment)
     llm.register_function("submit_answer", _submit_answer)
     llm.register_function("kb_answer", _kb_answer)
+    llm.register_function("verify_invitation_code", _verify_invitation_code)
 
     context = LLMContext(
         messages=[{"role": "system", "content": prompts.SYSTEM_AGENT}],
         tools=ToolsSchema(standard_tools=[
-            START_ASSESSMENT_SCHEMA, SUBMIT_ANSWER_SCHEMA, KB_ANSWER_SCHEMA,
+            VERIFY_INVITATION_SCHEMA, START_ASSESSMENT_SCHEMA, SUBMIT_ANSWER_SCHEMA,
+            KB_ANSWER_SCHEMA,
         ]),
     )
     # user_turn_strategies is the hook Pipecat 1.8 exposes for pluggable turn
@@ -468,42 +532,169 @@ async def build_interview_task(
         tail,          # transport.output() (live) or a capturing sink (self-test)
         assistant_agg,
     ])
-    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True))
+    task = PipelineTask(pipeline, params=PipelineParams(allow_interruptions=True,
+                                                        enable_metrics=True))
+
+    # PR-407: track frame activity for inactivity timeout detection.
+    last_activity = {"t": time.monotonic()}
+    task.add_observer(ActivityObserver(last_activity))
+    # PR-408: wire Pipecat's built-in latency observers for STT/LLM/TTS metrics.
+    task.add_observer(UserBotLatencyObserver())
+    task.add_observer(MetricsLogObserver())
 
     async def greet(*, provider_call_id: str, from_number: str, transport_kind: str) -> None:
-        # Create a call record for tracing; the agent then greets and asks which role.
         info = await tools.open_inbound(provider_call_id=provider_call_id,
                                         from_number=from_number, transport=transport_kind)
         state["call_id"] = info.get("call_id")
-
-        # The greeting kickoff must be a USER message, not a system one: qwen's chat
-        # template raises "No user query found in messages" if a turn has only system
-        # messages (gpt-oss tolerated it; qwen does not). Framing it as the call
-        # connecting makes the model greet naturally in response.
+        state["candidate_id"] = (info.get("candidate") or {}).get("id")
+        state["interview_id"] = (info.get("interview") or {}).get("id")
+        if info.get("prompt") == "verify_invitation_code":
+            kickoff = ("The call just connected. I couldn't automatically match my phone number — "
+                       "ask me to read out the invitation code from my interview confirmation. Call "
+                       "verify_invitation_code with whatever code I give you. Do NOT ask for my "
+                       "name or role yet, and do NOT accept a name/employee id in place of the code.")
+        else:
+            name = (info.get("candidate") or {}).get("name")
+            kickoff = ("The call just connected. Greet me warmly, say you're the automated "
+                       "screening assistant, and ask which role I'm interviewing for." +
+                      (f" Address me by name ({name})." if name else ""))
         context.set_messages([
             {"role": "system", "content": prompts.SYSTEM_AGENT},
-            {"role": "user", "content":
-             "The call just connected. Greet me warmly, say you're the automated screening "
-             "assistant, and in one short line ask for my NAME and which role I'm interviewing "
-             "for (for example Backend Engineer or Frontend Engineer). Do NOT call any function "
-             "yet — wait for me to give my name and role."},
+            {"role": "user", "content": kickoff},
         ])
         await task.queue_frames([LLMRunFrame()])
 
-    return task, greet
+    return task, greet, last_activity
+
+
+async def _duration_watchdog(task: PipelineTask, call_id: int, seconds: int) -> None:
+    """PR-021: force-end a Twilio call once it exceeds the configured maximum
+    duration. Mirrors the exact task.cancel(reason=...) pattern
+    scripts/selftest.py already uses to stop a live PipelineTask
+    deterministically. Cancelled by _on_disconnected if the call ends earlier."""
+    await asyncio.sleep(seconds)
+    await tools.close_call(call_id, status="DISCONNECTED")
+    await task.cancel(reason="max_call_duration_exceeded")
+
+
+async def _inactivity_watchdog(task: PipelineTask, call_id: int, seconds: int,
+                               last_activity: dict) -> None:
+    """PR-407: force-end a call after `seconds` of continuous silence from BOTH
+    parties (checked by polling, since — unlike max call duration — the deadline
+    resets on any activity rather than counting from connection start). Cancelled by
+    _on_disconnected if the call ends first."""
+    while True:
+        await asyncio.sleep(5)
+        if time.monotonic() - last_activity["t"] >= seconds:
+            await tools.close_call(call_id, status="DISCONNECTED")
+            await task.cancel(reason="inactivity_timeout")
+            return
 
 
 async def bot(runner_args: RunnerArguments) -> None:
+    """WebRTC (browser demo) or Twilio (public phone) entry point.
+
+    Twilio connections must redeem a one-use, Postgres-backed voice-session
+    token — minted by the signature-guarded POST /twilio/voice webhook and
+    embedded in the WSS URL's ?token= query param — before ANY transport or
+    provider work happens. This is deliberately NOT pipecat's own --ws-auth
+    mechanism: that one is per-process, in-memory (an HMAC secret and a used-
+    token set that live only in this one agent process and don't survive a
+    restart), gated behind pipecat's own POST /start. Our token must be minted
+    in the `api` service, keyed off the Twilio-signature-verified webhook, and
+    validated from here over HTTP against that same Postgres-backed state.
+
+    Twilio vs WebRTC is detected via isinstance(runner_args,
+    WebSocketRunnerArguments), not runner_args.transport_type: transport_type
+    is still None here for a Twilio connection — pipecat only populates it
+    inside create_transport(), which must not run before the token check.
+    """
+    twilio_claims: dict | None = None
+
+    if isinstance(runner_args, WebSocketRunnerArguments):
+        # The runner (pipecat/runner/run.py::_handle_telephony_ws) has already
+        # called websocket.accept() before invoking bot(), so .query_params is
+        # live here — no transport built, no provider touched yet.
+        token = runner_args.websocket.query_params.get("token")
+        if token and _TOKEN_SHAPE_RE.match(token):
+            twilio_claims = await tools.consume_voice_session(token)
+        else:
+            twilio_claims = {"ok": False}  # obviously-garbage shape: zero DB cost
+        if not twilio_claims.get("ok"):
+            await runner_args.websocket.close(code=4003)
+            return
+
     transport = await create_transport(runner_args, _transport_params())
-    task, greet = await build_interview_task(
+
+    if twilio_claims is not None:
+        # Defense-in-depth, not the primary gate (the consume above already
+        # proved this connection redeemed a token minted for a signature-
+        # verified webhook). create_transport() just parsed the media stream's
+        # own handshake and populated runner_args.call_data in place with
+        # Twilio's real CallSid. It should always equal the CallSid the token
+        # was minted for one step earlier in this same function; a mismatch
+        # means this connection isn't the one the token was issued to, even
+        # though it presented a validly-consumed token. Close before any
+        # audio/provider work.
+        real_call_sid = runner_args.call_data.call_id if runner_args.call_data else None
+        if real_call_sid != twilio_claims.get("provider_call_id"):
+            await runner_args.websocket.close(code=4003)
+            return
+
+    task, greet, last_activity = await build_interview_task(
         transport.input(), transport.output(),
         handle_sigint=getattr(runner_args, "handle_sigint", False),
     )
 
+    # Mirrors app.config.Settings.max_call_duration_seconds; the agent process
+    # doesn't import app.config (see Dockerfile.agent), so it reads the same
+    # env var directly — same pattern as TURN_DETECTION / SMART_TURN_STOP_SECS.
+    max_call_duration = int(os.getenv("MAX_CALL_DURATION_SECONDS", "900"))
+    max_inactivity = int(os.getenv("MAX_INACTIVITY_SECONDS", "120"))
+    watchdog_task: asyncio.Task | None = None
+    inactivity_task: asyncio.Task | None = None
+
     @transport.event_handler("on_client_connected")
     async def _on_connected(_transport, _client):
-        await greet(provider_call_id=f"WEB{int(time.time()*1000)}",
-                    from_number="browser-webrtc", transport_kind="webrtc")
+        nonlocal watchdog_task, inactivity_task
+        if twilio_claims is not None:
+            await greet(provider_call_id=twilio_claims["provider_call_id"],
+                        from_number=twilio_claims.get("from_number") or "unknown",
+                        transport_kind="twilio")
+            watchdog_task = asyncio.create_task(
+                _duration_watchdog(task, twilio_claims["call_id"], max_call_duration)
+            )
+            last_activity["t"] = time.monotonic()  # reset baseline at connect
+            inactivity_task = asyncio.create_task(
+                _inactivity_watchdog(task, twilio_claims["call_id"], max_inactivity, last_activity)
+            )
+        else:
+            demo_phone = os.getenv("DEMO_CALLER_PHONE", "+919000000001")
+            await greet(provider_call_id=f"WEB{int(time.time()*1000)}",
+                        from_number=demo_phone, transport_kind="webrtc")
+
+    if twilio_claims is not None:
+        @transport.event_handler("on_client_disconnected")
+        async def _on_disconnected(_transport, _client):
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+            if inactivity_task is not None:
+                inactivity_task.cancel()
+            # Cancel in-flight provider work immediately (PR-402).
+            try:
+                await task.cancel(reason="client_disconnected")
+            except Exception:
+                pass
+            # Mark the interview interrupted if one is in progress.
+            if state.get("interview_id") is not None:
+                try:
+                    await tools.mark_interrupted(interview_id=state["interview_id"],
+                                                 call_id=twilio_claims["call_id"])
+                except Exception:
+                    pass
+            # Idempotent (call_service.end_call): harmless if the watchdog's
+            # own cancel() already tore down the transport and fired this too.
+            await tools.close_call(twilio_claims["call_id"], status="DISCONNECTED")
 
     runner = PipelineRunner(handle_sigint=getattr(runner_args, "handle_sigint", False))
     await runner.run(task)
