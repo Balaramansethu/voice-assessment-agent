@@ -5,8 +5,11 @@ deterministic stub so the test is hermetic and asserts the state/persistence
 behaviour, not the model. Run inside the api container:
     docker compose exec api pytest tests/integration/test_assessment.py
 """
+from types import SimpleNamespace
+
 from sqlalchemy import func, select
 
+from app.config import settings
 from app.db.models import AssessmentAnswer, AssessmentSession
 from app.db.session import SessionLocal, init_db
 from app.services import assessment_service as asv
@@ -285,12 +288,13 @@ def test_grade_pending_stamps_exactly_once_when_last_grades_race(monkeypatch):
 
 
 def test_grade_endpoint_schedules_background_task(monkeypatch):
-    """Endpoint-level: POST /assessment/grade returns the next question and schedules the
-    background grade via BackgroundTasks (which TestClient runs after the response). The
-    response must NOT carry the internal _answer_id."""
+    """Endpoint-level: POST /assessment/grade returns the next question and creates a
+    durable GradingJob (no longer uses BackgroundTasks). The response must NOT carry the
+    internal _answer_id. The worker's run_once() processes the job and populates the score."""
     from fastapi.testclient import TestClient
 
     from app.main import app
+    from app.worker import grading_worker
 
     init_db()
     with SessionLocal() as setup:
@@ -298,24 +302,46 @@ def test_grade_endpoint_schedules_background_task(monkeypatch):
         setup.commit()
         sid = start["session_id"]
 
-    monkeypatch.setattr(asv, "_grade", _stub_grade_for([9.0]))
+    # Use a lambda instead of _stub_grade_for to avoid iterator exhaustion
+    monkeypatch.setattr(asv, "_grade", lambda *a, **k: {
+        "score": 9.0,
+        "rating": asv._rating_band(9.0),
+        "passed": True,
+        "reason": "stub",
+        "required_covered": [], "important_covered": [],
+        "important_missed": [], "optional_missed": [], "technical_errors": [],
+    })
 
     client = TestClient(app)
     resp = client.post("/assessment/grade",
-                       json={"session_id": sid, "transcript": "endpoint answer"})
+                       json={"session_id": sid, "call_id": 1, "transcript": "endpoint answer"},
+                       headers={"X-Agent-Key": settings.agent_shared_key})
     assert resp.status_code == 200
     body = resp.json()
     assert body["done"] is False
     assert "_answer_id" not in body                 # internal handle stripped
 
-    # TestClient runs BackgroundTasks synchronously after the response, so by now the
-    # first answer is graded (its own session_scope committed).
+    # The answer is persisted but ungraded (score=NULL) until the worker processes the job.
     with SessionLocal() as check:
         row = check.scalars(select(AssessmentAnswer)
                             .where(AssessmentAnswer.session_id == sid)).first()
         assert row is not None
         assert row.transcript == "endpoint answer"
-        assert row.score == 9.0                     # background task populated the score
+        assert row.score is None                     # not yet graded
+
+    # Run the worker to process the pending grading job
+    # run_once() may need multiple iterations if there are many jobs in the DB
+    for _ in range(10):
+        n = grading_worker.run_once()
+        if n == 0:
+            break
+
+    # Now the answer is graded
+    with SessionLocal() as check:
+        row = check.scalars(select(AssessmentAnswer)
+                            .where(AssessmentAnswer.session_id == sid)).first()
+        assert row is not None
+        assert row.score == 9.0, f"Expected score 9.0 but got {row.score}"
 
 
 def test_summary_and_answers_tolerate_null_scores_mid_grading(monkeypatch):
@@ -358,4 +384,120 @@ def test_summary_is_read_only_when_not_just_graded():
     s.commit()
     s.refresh(row)
     assert row.rating is None
+    assert row.completed_at is None
+
+
+def test_malformed_grades_do_not_stamp_completion(monkeypatch):
+    """An invalid model score remains ungraded, so completion cannot be stamped."""
+    s = _session()
+    start = asv.start_session(s, "Backend Engineer", candidate_name="Invalid Ivy")
+    s.commit()
+    sid = start["session_id"]
+
+    monkeypatch.setattr(asv, "_grade", lambda *args: asv._empty_grade("invalid score"))
+    answer_ids = [
+        asv.grade_answer(s, session_id=sid, transcript=f"answer {i}")["_answer_id"]
+        for i in range(start["total_questions"])
+    ]
+
+    for answer_id in answer_ids:
+        asv.grade_pending_answer(answer_id)
+
+    s.expire_all()
+    row = s.get(AssessmentSession, sid)
+    answers = s.scalars(
+        select(AssessmentAnswer).where(AssessmentAnswer.session_id == sid)
+    ).all()
+    assert all(answer.score is None for answer in answers)
+    assert row.completed_at is None
+    assert row.overall_score is None
+
+
+def test_by_call_accepts_provider_call_id_at_max_length():
+    """128 chars is the DB column width — a nonexistent call at exactly that length
+    must still resolve normally (200, ok:false), not 422."""
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    init_db()
+    client = TestClient(app)
+    resp = client.get("/assessment/by_call", params={"provider_call_id": "x" * 128},
+                      headers={"X-Agent-Key": settings.agent_shared_key})
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": False, "session_id": None, "message": "Unknown call."}
+
+
+def test_by_call_rejects_invalid_provider_call_id():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    init_db()
+    client = TestClient(app)
+    for provider_call_id in ("x" * 129, "   "):
+        resp = client.get("/assessment/by_call", params={"provider_call_id": provider_call_id},
+                          headers={"X-Agent-Key": settings.agent_shared_key})
+        assert resp.status_code == 422
+
+
+def test_by_call_rejects_missing_provider_call_id():
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    init_db()
+    client = TestClient(app)
+    resp = client.get("/assessment/by_call",
+                      headers={"X-Agent-Key": settings.agent_shared_key})
+    assert resp.status_code == 422
+
+
+def test_grade_pending_answer_persists_null_score_on_provider_error(monkeypatch):
+    """A REAL provider exception raised from the underlying client (not a monkeypatched
+    _grade stub) must not raise out of the background task, must persist score=None with
+    a safe (non-leaking) reason, and must not stamp session completion."""
+    import httpx
+    import openai
+
+    s = _session()
+    start = asv.start_session(s, "Backend Engineer", candidate_name="Provider Error Pat")
+    s.commit()
+    sid = start["session_id"]
+    total = start["total_questions"]
+
+    def _raise(**kwargs):
+        request = httpx.Request("POST", "https://api.groq.com/openai/v1/chat/completions")
+        response = httpx.Response(
+            400, request=request,
+            json={"error": {"message": "boom", "code": "json_validate_failed"}},
+        )
+        raise openai.BadRequestError(
+            "boom", response=response, body={"error": {"message": "boom"}}
+        )
+
+    class _Completions:
+        def create(self, **kwargs):
+            return _raise(**kwargs)
+
+    class _Client:
+        chat = SimpleNamespace(completions=_Completions())
+
+    monkeypatch.setattr(asv, "groq_client", lambda: _Client())
+
+    answer_ids = [
+        asv.grade_answer(s, session_id=sid, transcript=f"answer {i}")["_answer_id"]
+        for i in range(total)
+    ]
+
+    for answer_id in answer_ids:
+        asv.grade_pending_answer(answer_id)          # must not raise
+
+    s.expire_all()
+    rows = s.scalars(
+        select(AssessmentAnswer).where(AssessmentAnswer.session_id == sid)
+    ).all()
+    assert all(r.score is None for r in rows)
+    assert all(r.reason == "provider_error: BadRequestError" for r in rows)
+    row = s.get(AssessmentSession, sid)
     assert row.completed_at is None

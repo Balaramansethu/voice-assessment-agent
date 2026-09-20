@@ -5,33 +5,39 @@ from __future__ import annotations
 
 import time
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from app.api.auth import require_agent
+from app.api.schemas import bounded_str
 from app.config import settings
-from app.db.models import RagQueryLog
+from app.db.models import Call, RagQueryLog
 from app.db.session import get_session
 from app.rag import generate, retriever
 
-router = APIRouter(prefix="/rag", tags=["rag"])
+router = APIRouter(prefix="/rag", tags=["rag"], dependencies=[Depends(require_agent)])
+
+RagQuery = bounded_str(2_000)
+RoleFilter = bounded_str(200)
+RagSessionId = bounded_str(128)
 
 
 class KBSearchRequest(BaseModel):
-    query: str
-    role: str | None = None
-    session_id: str | None = None
+    query: RagQuery
+    role: RoleFilter | None = None
+    session_id: RagSessionId | None = None
 
 
 class KBAnswerRequest(BaseModel):
-    query: str
-    role: str | None = None
-    session_id: str | None = None
+    query: RagQuery
+    role: RoleFilter | None = None
+    session_id: RagSessionId | None = None
 
 
 class CandidateContextRequest(BaseModel):
-    candidate_id: int
-    query: str = "background experience skills"
+    call_id: int
+    query: RagQuery = "background experience skills"
 
 
 def _log(session: Session, *, scope, query, chunks, latency_ms, grounded, session_id):
@@ -93,10 +99,13 @@ def kb_answer(body: KBAnswerRequest, session: Session = Depends(get_session)) ->
 def candidate_context(body: CandidateContextRequest,
                       session: Session = Depends(get_session)) -> dict:
     """Candidate's OWN documents only (candidate-visible). Row-filtered by id."""
-    chunks = retriever.search_candidate(session, body.query, candidate_id=body.candidate_id,
+    call = session.get(Call, body.call_id)
+    if call is None or call.candidate_id is None:
+        raise HTTPException(404, "no resolved candidate for this call")
+    chunks = retriever.search_candidate(session, body.query, candidate_id=call.candidate_id,
                                         visibility="candidate")
     return {
-        "candidate_id": body.candidate_id,
+        "candidate_id": call.candidate_id,
         "documents": [{"doc_type": c.title, "similarity": round(c.similarity, 3),
                        "content": c.content} for c in chunks],
     }
