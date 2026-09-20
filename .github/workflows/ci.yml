@@ -18,13 +18,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Create .env from example
+      - name: Create .env and app/config.py from examples
         # .env is gitignored (real secrets never committed) — a fresh checkout has no
         # such file, and docker-compose's `env_file: .env` on api/worker fails outright
         # without one. The test suite needs no real Groq/Deepgram keys: every test that
         # touches those providers monkeypatches the client (grep this repo's tests for
         # `monkeypatch.setattr(asv, "groq_client", ...)` for the established pattern).
-        run: cp .env.example .env
+        #
+        # app/config.py is ALSO gitignored, and the Dockerfile's own self-heal step
+        # (`test -f app/config.py || cp app/config.example.py app/config.py`) only
+        # helps at build time — docker-compose's dev volume mount (`./app:/app/app`)
+        # then overlays the container's /app/app with this checkout at runtime,
+        # hiding whatever the image baked in. Without this file existing here too,
+        # `import app.config` fails at collection for every test (confirmed: this
+        # exact ModuleNotFoundError broke the first real CI run).
+        run: |
+          cp .env.example .env
+          cp app/config.example.py app/config.py
 
       - name: Build API and agent images
         # Built the same way this project's own dev/deploy workflow builds them
