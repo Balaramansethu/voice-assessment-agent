@@ -32,6 +32,27 @@ services:
       - fastembed_cache:/root/.cache/fastembed
     ports:
       - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import httpx; httpx.get('http://localhost:8000/live', timeout=2).raise_for_status()"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    build: .
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://interview:interview@postgres:5432/interview
+    command: ["python3", "-m", "app.worker.grading_worker"]
+    volumes:
+      - ./app:/app/app
+      - ./tests:/app/tests
+      - fastembed_cache:/root/.cache/fastembed
+    restart: unless-stopped
     depends_on:
       postgres:
         condition: service_healthy
@@ -52,6 +73,12 @@ services:
       - kokoro_models:/root/.cache     # cache the downloaded Kokoro model
     ports:
       - "7860:7860"
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import httpx; httpx.get('http://localhost:7860', timeout=3).raise_for_status()"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
     depends_on:
       - postgres
       - api

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from app.db.models import (
     AnswerEvaluation,
+    AssessmentSession,
     Call,
     Candidate,
     Interview,
@@ -18,7 +19,7 @@ from app.db.models import (
 )
 from app.domain.states import CallDirection, CallStatus, InterviewStatus
 from app.services.candidate_resolver import normalize_phone
-from app.services.interview_orchestrator import default_expiry
+from app.services import interview_orchestrator
 
 DEFAULT_QUESTIONS = [
     "To start, could you tell me briefly about your background and your current role?",
@@ -58,6 +59,12 @@ def _fresh_interview(session: Session, cand: Candidate, role: str) -> Interview:
         if call_ids:
             event_filter = event_filter | InterviewEvent.call_id.in_(call_ids)
         session.execute(delete(InterviewEvent).where(event_filter))
+        # PR-104's AssessmentSession.call_id/interview_id FKs (added after this function
+        # was first written) also reference these rows — clear before deleting Call/Interview.
+        session_filter = AssessmentSession.interview_id == iv.id
+        if call_ids:
+            session_filter = session_filter | AssessmentSession.call_id.in_(call_ids)
+        session.execute(delete(AssessmentSession).where(session_filter))
         # A call may also carry candidate_id without interview_id — clear any call
         # for this candidate that would dangle.
         session.execute(delete(Call).where(Call.interview_id == iv.id))
@@ -70,13 +77,16 @@ def _fresh_interview(session: Session, cand: Candidate, role: str) -> Interview:
     )
     if orphan_call_ids:
         session.execute(delete(InterviewEvent).where(InterviewEvent.call_id.in_(orphan_call_ids)))
+        session.execute(delete(AssessmentSession).where(
+            AssessmentSession.call_id.in_(orphan_call_ids)))
         session.execute(delete(Call).where(Call.id.in_(orphan_call_ids)))
     session.flush()
 
     interview = Interview(
         candidate_id=cand.id, role=role,
         status=InterviewStatus.NOT_STARTED.value,
-        current_question=0, expires_at=default_expiry(),
+        current_question=0, expires_at=interview_orchestrator.default_expiry(),
+        invitation_code=interview_orchestrator.generate_invitation_code(),
     )
     session.add(interview)
     session.flush()
@@ -158,5 +168,6 @@ def build(session: Session, kind: str, *, name: str = "Rahul",
         "scenario": kind,
         "candidate": {"id": cand.id, "name": cand.name, "phone": cand.phone},
         "interview": {"id": interview.id, "status": interview.status,
-                      "current_question": interview.current_question, "role": interview.role},
+                      "current_question": interview.current_question, "role": interview.role,
+                      "invitation_code": interview.invitation_code},
     }

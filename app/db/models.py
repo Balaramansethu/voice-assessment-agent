@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -309,6 +310,35 @@ class AssessmentAnswer(Base):
     created_at: Mapped[datetime] = _now()
 
     __table_args__ = (UniqueConstraint("session_id", "position"),)
+
+
+class GradingJob(Base):
+    """Durable grading queue row (P3). Exactly one per AssessmentAnswer, inserted in the
+    SAME transaction as the answer (assessment_service.grade_answer) — either both commit
+    or neither does, so an answer can never exist without a job to grade it.
+    PR-509: call_id denormalized for fast correlation (CallSid → session → job chain)."""
+    __tablename__ = "grading_job"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    answer_id: Mapped[int] = mapped_column(ForeignKey("assessment_answer.id"), unique=True, index=True)
+    call_id: Mapped[int | None] = mapped_column(ForeignKey("call.id"), index=True)  # PR-509: correlation
+    status: Mapped[str] = mapped_column(String(20), default="PENDING")  # PENDING|RUNNING|RETRY|COMPLETE|FAILED
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    lease_owner: Mapped[str | None] = mapped_column(String(64))
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    error_category: Mapped[str | None] = mapped_column(String(20))  # RETRYABLE|PERMANENT
+    last_error: Mapped[str | None] = mapped_column(Text)
+    prompt_version: Mapped[str] = mapped_column(String(20))
+    model_version: Mapped[str] = mapped_column(String(64))
+    rubric_version: Mapped[str] = mapped_column(String(20))
+    created_at: Mapped[datetime] = _now()
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(),
+                                                  onupdate=func.now())
+
+    __table_args__ = (
+        Index("ix_grading_job_claim", "status", "next_attempt_at"),
+    )
 
 
 class RagQueryLog(Base):
