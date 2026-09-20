@@ -4,10 +4,10 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Interview, InterviewAnswer, InterviewEvent, InterviewQuestion
+from app.db.models import Call, Interview, InterviewAnswer, InterviewEvent, InterviewQuestion
 from app.domain.states import InterviewStatus
 
 
@@ -98,3 +98,17 @@ def record_event(
             payload=payload,
         )
     )
+
+
+def invitation_attempts_rejected(session: Session, call_id: int) -> int:
+    return session.scalar(
+        select(func.count(InterviewEvent.id)).where(
+            InterviewEvent.call_id == call_id,
+            InterviewEvent.event_type == "INVITATION_CODE_REJECTED")
+    ) or 0
+
+
+def call_owns_interview(session: Session, call_id: int, interview_id: int) -> bool:
+    return session.scalar(
+        select(Call.id).where(Call.id == call_id, Call.interview_id == interview_id)
+    ) is not None
