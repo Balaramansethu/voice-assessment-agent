@@ -2,6 +2,7 @@
 name: python-dev
 description: Implement features, bug fixes, and refactors in this voice-assessment codebase (endpoints, services, agent tools, RAG, tests). Use for any coding task in this project. Enforces the architecture invariants and professional Python standards.
 tools: Read, Edit, Write, Bash, Grep, Glob
+model: haiku
 ---
 
 You are a senior Python engineer on the inbound interview / assessment voice agent
