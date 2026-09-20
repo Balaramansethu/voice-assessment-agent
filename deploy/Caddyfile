@@ -1,8 +1,16 @@
 # Automatic HTTPS (Let's Encrypt) for the public host.
-#   /ws*  → agent's media WebSocket (protected by the runner's one-time tokens)
+#   /ws*  → agent's media WebSocket, protected by the app's own one-use voice-
+#           session tokens (app/agent/pipeline.py / app/services/
+#           voice_session_service.py). This access log lets a host-level
+#           fail2ban jail throttle raw connection floods to /ws before they
+#           ever reach the agent process — see RUNBOOK.local.md.
 #   else  → the Twilio webhook guard on the api service, which validates the
 #           X-Twilio-Signature and only forwards genuine Twilio calls to the agent.
 {$PUBLIC_HOST} {
+	log {
+		output file /data/access.log
+		format json
+	}
 	@ws path /ws*
 	handle @ws {
 		reverse_proxy agent:7860

@@ -118,7 +118,39 @@ class Call(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     answered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     ended_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_invitation_code: Mapped[str | None] = mapped_column(String(12))
     created_at: Mapped[datetime] = _now()
+
+
+class VoiceSessionToken(Base):
+    """One-use Twilio voice-session token (PR-016/017). Only the sha256 digest
+    is stored — never the raw token. call_id is nullable, ON DELETE SET NULL
+    (disposable bookkeeping, not the interview_event audit trail)."""
+    __tablename__ = "voice_session_token"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    token_digest: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    provider_call_id: Mapped[str] = mapped_column(String(128), index=True)
+    from_number: Mapped[str | None] = mapped_column(String(32), index=True)
+    to_number: Mapped[str | None] = mapped_column(String(32))
+    purpose: Mapped[str] = mapped_column(String(32), default="twilio_stream")
+    issued_at: Mapped[datetime] = _now()
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    consumed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    call_id: Mapped[int | None] = mapped_column(ForeignKey("call.id", ondelete="SET NULL"))
+
+    __table_args__ = (
+        # PR-019 hardening: Twilio retries a slow webhook response with the
+        # SAME CallSid, which would otherwise mint two simultaneously-valid
+        # tokens. At most one UNCONSUMED token may exist per CallSid at a
+        # time — mint_token() proactively invalidates any prior live token
+        # for the same CallSid before inserting a new one (see
+        # voice_session_service.py); this index is the atomic backstop for a
+        # genuinely concurrent double-mint race the proactive invalidate
+        # can't fully close on its own.
+        Index("ix_voice_session_token_live_provider_call_id", "provider_call_id",
+              unique=True, postgresql_where=consumed_at.is_(None)),
+    )
 
 
 class InterviewEvent(Base):
