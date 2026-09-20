@@ -33,6 +33,12 @@ docker compose up -d
 docker compose up -d --build            # after changing deps/Dockerfile
 docker compose logs api                 # debug 500s here — tracebacks land in api logs
 
+# grading worker (P3) — REQUIRED for assessment answers to ever get scored. `docker compose
+# up -d` alone starts postgres+api only; grade_answer() commits a GradingJob row but nothing
+# claims it until the worker runs. `docker compose logs worker` / `docker compose exec api
+# python3 -c "..."` against GET /observability/grading (ops-scoped) shows backlog/failed counts.
+docker compose up -d worker
+
 # tests (run inside the api container — deps live there, host Python is 3.14 with no wheels)
 docker compose exec api pytest tests/unit          # pure state-machine, no DB
 docker compose exec api pytest tests/integration   # full flow vs real Postgres
