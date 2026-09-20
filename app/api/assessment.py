@@ -1,25 +1,48 @@
 """Assessment endpoints — role-based quiz with live, silent, graded validation."""
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, field_validator
 from sqlalchemy.orm import Session
 
+from app.api.auth import require_agent, require_agent_or_recruiter, require_recruiter
+from app.api.schemas import bounded_str
+from app.db.models import Call
 from app.db.session import get_session
 from app.services import assessment_service as asv
 
 router = APIRouter(prefix="/assessment", tags=["assessment"])
 
+# NOTE: deliberately NOT stripped — a whitespace-only transcript ("   ") is a legitimate
+# STT silence/babble artifact and must reach assessment_service.grade_answer's existing
+# no-op handling (blank-transcript branch), not 422 here. See
+# test_grade_request_accepts_whitespace_only_transcript.
+Transcript = bounded_str(12_000, strip=False)
+Role = bounded_str(200)
+CandidateName = bounded_str(200)
+# NOTE: max_length counts Unicode code points, not visual/grapheme characters — an
+# NFD-decomposed name (base letter + combining marks) could hit this limit sooner than a
+# candidate would expect. Documented limitation, not a functional fix.
+ProviderCallId = bounded_str(128)
+
 
 class StartRequest(BaseModel):
-    role: str
-    candidate_name: str | None = None
-    call_id: int | None = None
+    role: Role
+    candidate_name: CandidateName | None = None
+    call_id: int
+
+    @field_validator("candidate_name", mode="before")
+    @classmethod
+    def _blank_name_is_none(cls, v):
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return v
 
 
 class GradeRequest(BaseModel):
     session_id: int
-    transcript: str
+    call_id: int
+    transcript: Transcript
 
 
 @router.get("/roles")
@@ -35,31 +58,39 @@ def questions(role: str, session: Session = Depends(get_session)) -> dict:
 
 
 @router.post("/start")
-def start(body: StartRequest, session: Session = Depends(get_session)) -> dict:
+def start(body: StartRequest, session: Session = Depends(get_session),
+          _=Depends(require_agent)) -> dict:
+    call = session.get(Call, body.call_id)
+    if call is None:
+        raise HTTPException(404, "call not found")
     return asv.start_session(session, body.role, candidate_name=body.candidate_name,
-                             call_id=body.call_id)
+                             call_id=body.call_id, candidate_id=call.candidate_id,
+                             interview_id=call.interview_id,
+                             invitation_code_used=call.resolved_invitation_code)
 
 
 @router.post("/grade")
-def grade(body: GradeRequest, background_tasks: BackgroundTasks,
-          session: Session = Depends(get_session)) -> dict:
+def grade(body: GradeRequest, session: Session = Depends(get_session),
+          _=Depends(require_agent)) -> dict:
     """Submit the current answer and return the next question (or the done response)
-    IMMEDIATELY. Silent grading is SCHEDULED to run in the background after the response
-    is sent — it's recruiter-only, so it has no business on the conversation critical path.
+    IMMEDIATELY. Silent grading is DURABLE — each answer gets a GradingJob row committed
+    in the same transaction as the answer, claimed independently by the separate `grading_worker`
+    process. This is recruiter-only, so it has no business on the conversation critical path.
 
-    The sync endpoint runs in FastAPI's threadpool; BackgroundTasks fire after the
-    response, and `grade_pending_answer` opens its own DB session (this request's session
-    is closed by then). `_answer_id` is an internal handle — stripped before the response
-    so the agent tool contract stays {next_question} / {done}."""
+    The sync endpoint runs in FastAPI's threadpool. Grading happens asynchronously via the
+    durable worker: it opens its own DB session and processes the job queue, shielding the
+    worker from API process crashes. `_answer_id` is an internal handle — stripped before the
+    response so the agent tool contract stays {next_question} / {done}."""
+    if not asv.call_owns_session(session, body.session_id, body.call_id):
+        raise HTTPException(404, "assessment session not found")
     result = asv.grade_answer(session, session_id=body.session_id, transcript=body.transcript)
-    answer_id = result.pop("_answer_id", None)
-    if answer_id is not None:
-        background_tasks.add_task(asv.grade_pending_answer, answer_id)
+    result.pop("_answer_id", None)  # strip internal handle
     return result
 
 
 @router.get("/by_call")
-def by_call(provider_call_id: str, session: Session = Depends(get_session)) -> dict:
+def by_call(provider_call_id: ProviderCallId, session: Session = Depends(get_session),
+            _=Depends(require_agent_or_recruiter)) -> dict:
     """Resolve the assessment session opened against a given provider_call_id.
 
     Read-only, transition-free. The offline self-test harness opens a call with a unique
@@ -79,7 +110,8 @@ def by_call(provider_call_id: str, session: Session = Depends(get_session)) -> d
 
 
 @router.get("/{session_id}/answers")
-def answers(session_id: int, session: Session = Depends(get_session)) -> dict:
+def answers(session_id: int, session: Session = Depends(get_session),
+            _=Depends(require_recruiter)) -> dict:
     """Raw persisted answers for a session (position + transcript + score/rating).
 
     Read-only, transition-free. Exposed so the offline self-test harness — which runs
@@ -102,7 +134,8 @@ def answers(session_id: int, session: Session = Depends(get_session)) -> dict:
 
 
 @router.get("/{session_id}/summary")
-def summary(session_id: int, session: Session = Depends(get_session)) -> dict:
+def summary(session_id: int, session: Session = Depends(get_session),
+            _=Depends(require_recruiter)) -> dict:
     from app.db.models import AssessmentSession
     s = session.get(AssessmentSession, session_id)
     if s is None:

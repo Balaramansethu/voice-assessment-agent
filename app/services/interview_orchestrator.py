@@ -6,6 +6,7 @@ performs the transition inside a transaction that row-locks the interview
 """
 from __future__ import annotations
 
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
@@ -38,6 +39,15 @@ class OrchestrationResult:
     current_question: int | None
     message: str
     current_question_text: str | None = None
+
+
+_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"  # no 0/O/1/I/L — spoken-friendly
+
+
+def generate_invitation_code(length: int = 8) -> str:
+    """32^8 ≈ 1.1e12 space — brute force is moot given the 5-attempt lockout in
+    app/api/calls.py::verify_invitation."""
+    return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(length))
 
 
 def _lock_interview(session: Session, interview_id: int) -> Interview:

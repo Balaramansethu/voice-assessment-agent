@@ -57,6 +57,7 @@ class Interview(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    invitation_code: Mapped[str | None] = mapped_column(String(12), index=True, unique=True)
     created_at: Mapped[datetime] = _now()
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
@@ -267,6 +268,9 @@ class AssessmentSession(Base):
     role: Mapped[str] = mapped_column(String(200), index=True)
     candidate_name: Mapped[str | None] = mapped_column(String(200))
     call_id: Mapped[int | None] = mapped_column(ForeignKey("call.id"))
+    candidate_id: Mapped[int | None] = mapped_column(ForeignKey("candidate.id"), index=True)
+    interview_id: Mapped[int | None] = mapped_column(ForeignKey("interview.id"), index=True)
+    invitation_code_used: Mapped[str | None] = mapped_column(String(12))
     # Final aggregate result, written once when the last question is graded.
     # NULL until completion; derived from assessment_answer (single source of truth).
     total_questions: Mapped[int | None] = mapped_column(Integer)

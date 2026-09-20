@@ -32,12 +32,12 @@ class ScenarioRequest(BaseModel):
 class IntentRequest(BaseModel):
     interview_id: int
     intent: Intent
-    call_id: int | None = None
+    call_id: int
 
 
 class AnswerRequest(BaseModel):
     transcript: str
-    call_id: int | None = None
+    call_id: int
 
 
 class ResolveRequest(BaseModel):
@@ -57,3 +57,20 @@ class InboundCallRequest(BaseModel):
     from_number: str
     to_number: str | None = None
     transport: str = "webrtc"
+
+
+class EndCallRequest(BaseModel):
+    status: CallStatus = CallStatus.DISCONNECTED
+
+
+class ConsumeSessionRequest(BaseModel):
+    token: bounded_str(256)
+
+
+class VerifyInvitationRequest(BaseModel):
+    call_id: int
+    code: bounded_str(12, min_length=4)
+
+
+class CallScopedRequest(BaseModel):
+    call_id: int

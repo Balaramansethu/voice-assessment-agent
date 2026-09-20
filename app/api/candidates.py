@@ -4,13 +4,15 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from app.api.auth import require_recruiter
 from app.api.schemas import ResolveRequest
 from app.db.models import Candidate
 from app.db.session import get_session
 from app.services import candidate_resolver as cr
 from app.services import interview_service as iv
 
-router = APIRouter(prefix="/candidates", tags=["candidates"])
+router = APIRouter(prefix="/candidates", tags=["candidates"],
+                   dependencies=[Depends(require_recruiter)])
 
 
 @router.get("/{candidate_id}")
