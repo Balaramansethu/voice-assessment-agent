@@ -133,6 +133,16 @@ def resolve_role(session: Session, role_text: str) -> str | None:
     for r in roles:                                   # contains either way
         if text in r.lower() or r.lower().split()[0] in text:
             return r
+    # Whitespace-insensitive fallback: STT/LLM transcription of a spoken compound
+    # word like "Frontend" frequently renders it as two words ("Front end") — a real
+    # call looped 3 times on exactly this ("Front end Engineer" vs seeded "Frontend
+    # Engineer") before the caller gave up. Collapse whitespace on both sides as a
+    # last resort so this doesn't read as "role not available."
+    compact_text = text.replace(" ", "")
+    for r in roles:
+        compact_r = r.lower().replace(" ", "")
+        if compact_text in compact_r or compact_r in compact_text:
+            return r
     return None
 
 
