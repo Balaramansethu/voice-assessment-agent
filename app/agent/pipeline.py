@@ -301,6 +301,17 @@ async def build_interview_task(
         # punctuation-only fragment before TTS.
         settings=GroqLLMService.Settings(
             model=os.getenv("GROQ_LLM_MODEL", "qwen/qwen3.8-27b"),
+            # Unbounded output hit Groq's per-request output-token-per-minute limit
+            # (OTPM 1000) on a single turn that tried to generate 1339 tokens — a
+            # "request too large" 429 that no amount of retrying fixes, since it's the
+            # same oversized request every time. The SDK's own retry-with-backoff kept
+            # resubmitting it for ~111s of dead air until the caller spoke over it.
+            # 300 comfortably covers a full kb_answer readback of the longest seeded KB
+            # chunk (~110 tokens) plus lead-in/wrap-up, while a reply that overshoots it
+            # just gets truncated by Groq — never another OTPM 429, never a multi-turn
+            # hang. Every reply here is meant to be one short spoken sentence anyway
+            # (system prompt rule 5), so this should never bind in normal operation.
+            max_tokens=300,
         ),
     )
     # Deepgram Aura streaming TTS.
