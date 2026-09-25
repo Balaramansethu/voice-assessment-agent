@@ -83,6 +83,12 @@ TTFB_HARD_MAX_S = 8.0           # no single reply may exceed this
 TURN_RESPONSE_TIMEOUT_S = 30.0  # per-turn wait for the bot to reply before giving up
 FINAL_DRAIN_S = 8.0             # after the last answer, wait this long for completion
 API_BASE = os.getenv("API_BASE", "http://api:8000")
+# P1's scope-gated auth applies to /assessment/by_call (agent-or-recruiter) and
+# /assessment/{id}/summary|answers (recruiter) — this harness runs in the agent
+# container (no app.config import, per Dockerfile.agent's split), so it reads the
+# same env vars directly, matching app/agent/tools.py's own pattern.
+_AGENT_HEADERS = {"X-Agent-Key": os.getenv("AGENT_SHARED_KEY", "dev-agent-key-change-me")}
+_RECRUITER_HEADERS = {"X-Recruiter-Key": os.getenv("RECRUITER_SHARED_KEY", "dev-recruiter-key-change-me")}
 
 # Utterances the synthetic candidate "speaks": name+role, then 5 frontend answers.
 # Quality is deliberately varied (strong → weak) so grading differs across positions.
@@ -347,7 +353,8 @@ def _resolve_session_id(provider_call_id: str) -> int | None:
     so we resolve it over HTTP: the api maps our unique provider_call_id → its Call row →
     the AssessmentSession opened against that call_id during the run."""
     with httpx.Client(base_url=API_BASE, timeout=10) as c:
-        r = c.get("/assessment/by_call", params={"provider_call_id": provider_call_id})
+        r = c.get("/assessment/by_call", params={"provider_call_id": provider_call_id},
+                  headers=_AGENT_HEADERS)
         if r.status_code == 200:
             return r.json().get("session_id")
     return None
@@ -531,8 +538,9 @@ async def main() -> int:
         return 3
 
     with httpx.Client(base_url=API_BASE, timeout=10) as c:
-        summary = c.get(f"/assessment/{session_id}/summary").json()
-        answers = c.get(f"/assessment/{session_id}/answers").json().get("answers", [])
+        summary = c.get(f"/assessment/{session_id}/summary", headers=_RECRUITER_HEADERS).json()
+        answers = c.get(f"/assessment/{session_id}/answers",
+                        headers=_RECRUITER_HEADERS).json().get("answers", [])
 
     log(f"Captured: {len(obs.tts_started)} TTS utterances, "
         f"{len(obs.interruptions)} interruptions, {len(answers)} persisted answers.")
