@@ -9,9 +9,11 @@ from sqlalchemy.orm import Session
 
 from app.db.models import (
     AnswerEvaluation,
+    AssessmentAnswer,
     AssessmentSession,
     Call,
     Candidate,
+    GradingJob,
     Interview,
     InterviewAnswer,
     InterviewEvent,
@@ -42,6 +44,22 @@ def _upsert_candidate(session: Session, name: str, phone: str, email: str) -> Ca
     return cand
 
 
+def _clear_assessment_sessions(session: Session, session_filter) -> None:
+    """Delete AssessmentSession rows matching `session_filter`, plus their
+    AssessmentAnswer and GradingJob rows first (both FK further down from
+    AssessmentSession, so both must clear before it or before Call/Interview)."""
+    session_ids = list(session.scalars(select(AssessmentSession.id).where(session_filter)))
+    if not session_ids:
+        return
+    answer_ids = list(session.scalars(
+        select(AssessmentAnswer.id).where(AssessmentAnswer.session_id.in_(session_ids))
+    ))
+    if answer_ids:
+        session.execute(delete(GradingJob).where(GradingJob.answer_id.in_(answer_ids)))
+    session.execute(delete(AssessmentAnswer).where(AssessmentAnswer.session_id.in_(session_ids)))
+    session.execute(delete(AssessmentSession).where(session_filter))
+
+
 def _fresh_interview(session: Session, cand: Candidate, role: str) -> Interview:
     # POC: one active interview per candidate — clear prior ones for a clean scenario.
     prior = session.scalars(select(Interview).where(Interview.candidate_id == cand.id)).all()
@@ -61,10 +79,13 @@ def _fresh_interview(session: Session, cand: Candidate, role: str) -> Interview:
         session.execute(delete(InterviewEvent).where(event_filter))
         # PR-104's AssessmentSession.call_id/interview_id FKs (added after this function
         # was first written) also reference these rows — clear before deleting Call/Interview.
+        # This exact ordering gap (AssessmentAnswer/GradingJob under AssessmentSession)
+        # only surfaced once a real WebRTC test call left genuine graded answers behind
+        # for the scenario's own demo candidate to collide with on the next reset.
         session_filter = AssessmentSession.interview_id == iv.id
         if call_ids:
             session_filter = session_filter | AssessmentSession.call_id.in_(call_ids)
-        session.execute(delete(AssessmentSession).where(session_filter))
+        _clear_assessment_sessions(session, session_filter)
         # A call may also carry candidate_id without interview_id — clear any call
         # for this candidate that would dangle.
         session.execute(delete(Call).where(Call.interview_id == iv.id))
@@ -77,8 +98,7 @@ def _fresh_interview(session: Session, cand: Candidate, role: str) -> Interview:
     )
     if orphan_call_ids:
         session.execute(delete(InterviewEvent).where(InterviewEvent.call_id.in_(orphan_call_ids)))
-        session.execute(delete(AssessmentSession).where(
-            AssessmentSession.call_id.in_(orphan_call_ids)))
+        _clear_assessment_sessions(session, AssessmentSession.call_id.in_(orphan_call_ids))
         session.execute(delete(Call).where(Call.id.in_(orphan_call_ids)))
     session.flush()
 
