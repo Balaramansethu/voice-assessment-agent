@@ -102,16 +102,6 @@ KB_ANSWER_SCHEMA = FunctionSchema(
     required=["query"],
 )
 
-VERIFY_INVITATION_SCHEMA = FunctionSchema(
-    name="verify_invitation_code",
-    description="Verify the caller's identity using the invitation/interview code from "
-                "their interview confirmation email or SMS. Call this ONLY when told the "
-                "caller's identity is not yet established.",
-    properties={"code": {"type": "string", "description": "The code the caller read out."}},
-    required=["code"],
-)
-
-
 # Matches a fragment made up solely of dots/ellipses (e.g. "..", "...", "…", ". . .").
 # A single "." is intentionally NOT caught here — see _is_unspeakable.
 _DOTS_ONLY_RE = re.compile(r"^[.…]+$")
@@ -480,33 +470,14 @@ async def build_interview_task(
                 "Read this answer to the caller conversationally, then continue the assessment "
                 "from where you left off (re-ask the current question if needed)."})
 
-    async def _verify_invitation_code(params: FunctionCallParams) -> None:
-        res = await tools.verify_invitation_code(call_id=state["call_id"],
-                                                 code=params.arguments["code"])
-        if res.get("resolved"):
-            state["candidate_id"] = res["candidate"]["id"]
-            state["interview_id"] = (res.get("interview") or {}).get("id")
-            await params.result_callback({"ok": True, "instruction":
-                f"Identity verified as {res['candidate']['name']}. Greet them by name, then ask "
-                "which role they're interviewing for."})
-        elif res.get("locked"):
-            await params.result_callback({"ok": False, "instruction":
-                "Too many attempts. Apologize briefly and say you're connecting them with "
-                "recruiting. Do NOT ask for the code again."})
-        else:
-            await params.result_callback({"ok": False, "instruction":
-                "That code wasn't recognized. Ask them to repeat it carefully, or offer to "
-                "connect them with recruiting."})
-
     llm.register_function("start_assessment", _start_assessment)
     llm.register_function("submit_answer", _submit_answer)
     llm.register_function("kb_answer", _kb_answer)
-    llm.register_function("verify_invitation_code", _verify_invitation_code)
 
     context = LLMContext(
         messages=[{"role": "system", "content": prompts.SYSTEM_AGENT}],
         tools=ToolsSchema(standard_tools=[
-            VERIFY_INVITATION_SCHEMA, START_ASSESSMENT_SCHEMA, SUBMIT_ANSWER_SCHEMA,
+            START_ASSESSMENT_SCHEMA, SUBMIT_ANSWER_SCHEMA,
             KB_ANSWER_SCHEMA,
         ]),
     )
@@ -548,16 +519,13 @@ async def build_interview_task(
         state["call_id"] = info.get("call_id")
         state["candidate_id"] = (info.get("candidate") or {}).get("id")
         state["interview_id"] = (info.get("interview") or {}).get("id")
-        if info.get("prompt") == "verify_invitation_code":
-            kickoff = ("The call just connected. I couldn't automatically match my phone number — "
-                       "ask me to read out the invitation code from my interview confirmation. Call "
-                       "verify_invitation_code with whatever code I give you. Do NOT ask for my "
-                       "name or role yet, and do NOT accept a name/employee id in place of the code.")
-        else:
-            name = (info.get("candidate") or {}).get("name")
-            kickoff = ("The call just connected. Greet me warmly, say you're the automated "
-                       "screening assistant, and ask which role I'm interviewing for." +
-                      (f" Address me by name ({name})." if name else ""))
+        # No identity gate: go straight into the assessment regardless of whether
+        # open_inbound resolved a candidate by phone. If it did, use the name as a
+        # courtesy greeting only — never a precondition to proceed.
+        name = (info.get("candidate") or {}).get("name")
+        kickoff = ("The call just connected. Greet me warmly, say you're the automated "
+                   "screening assistant, and ask which role I'm interviewing for." +
+                  (f" Address me by name ({name})." if name else ""))
         context.set_messages([
             {"role": "system", "content": prompts.SYSTEM_AGENT},
             {"role": "user", "content": kickoff},
