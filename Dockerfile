@@ -30,6 +30,14 @@ COPY app ./app
 # template if the host didn't already provide a customized one — never overwrites an
 # existing app/config.py, so local customization wins.
 RUN test -f app/config.py || cp app/config.example.py app/config.py
+# Pre-warm the fastembed embedding model at BUILD time — same rationale/pattern as the
+# NLTK data bake-in in Dockerfile.agent. Without this, get_embedder()'s first real call
+# (e.g. the first kb_answer during a live phone call) triggers a live, unauthenticated
+# Hugging Face Hub download (several seconds, network-dependent) INSIDE that request,
+# stalling a real caller with dead air while the model downloads. Baking it into the
+# image means every container starts warm — zero network calls for embeddings at
+# runtime, ever, in production.
+RUN python3 -c "from app.rag.embeddings import get_embedder; get_embedder()"
 # tests/unit/test_production_mode.py asserts against this file's content and reads it
 # relative to its own path — it must exist at /app/docker-compose.prod.yml, matching
 # WORKDIR, for that test to pass when the suite runs inside this container.
