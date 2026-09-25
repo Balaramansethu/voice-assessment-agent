@@ -238,7 +238,7 @@ async def _run_pipeline(obs: CaptureObserver, source: ScriptedAudioSource,
     finishes it queues an EndFrame so the runner returns and the process can exit.
     """
     sink = CapturingSink()
-    task, greet, last_activity = await build_interview_task(source, sink)
+    task, greet, last_activity, _state = await build_interview_task(source, sink)
     # build_interview_task constructs the task with PipelineParams defaults
     # (audio_in_sample_rate=16000, audio_out_sample_rate=24000), which already match our
     # synthesized 16 kHz input — no param override needed.

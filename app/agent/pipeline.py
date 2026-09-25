@@ -254,10 +254,14 @@ async def build_interview_task(
     `transport.input()` / `transport.output()`; the offline self-test harness passes a
     scripted audio source / capturing sink. Neither forks the pipeline logic.
 
-    Returns `(task, greet, last_activity)`: the assembled `PipelineTask`, an async `greet()`
-    that seeds the greeting kickoff turn (what `on_client_connected` fires for a live call),
-    and a dict used by the inactivity watchdog to track activity timestamps. The caller owns
-    the run loop and, for the transport case, the event wiring.
+    Returns `(task, greet, last_activity, state)`: the assembled `PipelineTask`, an async
+    `greet()` that seeds the greeting kickoff turn (what `on_client_connected` fires for a
+    live call), a dict used by the inactivity watchdog to track activity timestamps, and
+    the per-connection identity/session state dict (candidate_id/interview_id/call_id) —
+    `bot()`'s `on_client_disconnected` handler needs this to know whether an interview is
+    in progress when the call drops, and it lives in a different function's scope than the
+    `state` closed over by the tool handlers defined here. The caller owns the run loop
+    and, for the transport case, the event wiring.
     """
     groq_key = os.environ["GROQ_API_KEY"]
     deepgram_key = os.environ["DEEPGRAM_API_KEY"]
@@ -532,7 +536,7 @@ async def build_interview_task(
         ])
         await task.queue_frames([LLMRunFrame()])
 
-    return task, greet, last_activity
+    return task, greet, last_activity, state
 
 
 async def _duration_watchdog(task: PipelineTask, call_id: int, seconds: int) -> None:
@@ -617,7 +621,7 @@ async def bot(runner_args: RunnerArguments) -> None:
             await runner_args.websocket.close(code=4003)
             return
 
-    task, greet, last_activity = await build_interview_task(
+    task, greet, last_activity, state = await build_interview_task(
         transport.input(), transport.output(),
         handle_sigint=getattr(runner_args, "handle_sigint", False),
     )
