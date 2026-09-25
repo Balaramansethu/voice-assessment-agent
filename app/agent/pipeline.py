@@ -613,9 +613,17 @@ async def bot(runner_args: RunnerArguments) -> None:
 
     if isinstance(runner_args, WebSocketRunnerArguments):
         # The runner (pipecat/runner/run.py::_handle_telephony_ws) has already
-        # called websocket.accept() before invoking bot(), so .query_params is
-        # live here — no transport built, no provider touched yet.
-        token = runner_args.websocket.query_params.get("token")
+        # called websocket.accept() before invoking bot(), so .path_params /
+        # .query_params are live here — no transport built, no provider touched yet.
+        # Path segment first: Twilio's real Media Streams client does not reliably
+        # forward a "?token=..." query string on the actual WSS connection (confirmed
+        # in production via Caddy's access log — the incoming URI arrived as bare
+        # "/ws", token dropped), so the token travels as a path segment
+        # (wss://.../ws/<token>, matching pipecat's own pre-registered /ws/{token}
+        # route — see app/api/telephony.py::_stream_twiml). query_params is kept as
+        # a fallback for any other client that does preserve it.
+        token = (runner_args.websocket.path_params.get("token")
+                 or runner_args.websocket.query_params.get("token"))
         if token and _TOKEN_SHAPE_RE.match(token):
             twilio_claims = await tools.consume_voice_session(token)
         else:

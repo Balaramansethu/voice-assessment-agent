@@ -11,7 +11,7 @@ import threading
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
@@ -89,7 +89,10 @@ def _configure(monkeypatch):
 def _extract_token(twiml: str) -> str:
     root = ET.fromstring(twiml)
     stream_url = root.find("./Connect/Stream").attrib["url"]
-    return parse_qs(urlsplit(stream_url).query)["token"][0]
+    # Path segment (wss://.../ws/<token>), not a query string — Twilio's real
+    # Media Streams client doesn't reliably forward "?token=..." on the actual
+    # WSS connection; see app/api/telephony.py::_stream_twiml.
+    return urlsplit(stream_url).path.rsplit("/", 1)[-1]
 
 
 _AGENT_HEADERS = {"X-Agent-Key": settings.agent_shared_key}

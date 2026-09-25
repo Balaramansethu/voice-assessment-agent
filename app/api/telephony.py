@@ -74,7 +74,15 @@ def _reject_twiml() -> Response:
 
 
 def _stream_twiml(token: str) -> Response:
-    wss_url = escape(f"wss://{settings.public_host}/ws?token={token}")
+    # Path segment, NOT a query string: Twilio's Media Streams WebSocket client
+    # (User-Agent "Twilio.TmeWs/1.0") does not reliably forward the query string
+    # from <Stream url="..."> when it actually opens the WSS connection — confirmed
+    # via Caddy's access log showing the incoming request URI as bare "/ws" with the
+    # "?token=..." dropped entirely, even though this function emits it correctly.
+    # pipecat's own runner already registers /ws/{token} as a route (for its own,
+    # unused-here, --ws-auth mechanism); app/agent/pipeline.py's bot() reads the
+    # token from the path segment via runner_args.websocket.path_params.
+    wss_url = escape(f"wss://{settings.public_host}/ws/{token}")
     xml = ('<?xml version="1.0" encoding="UTF-8"?>'
           f'<Response><Connect><Stream url="{wss_url}"/></Connect></Response>')
     return Response(content=xml, media_type="text/xml")
