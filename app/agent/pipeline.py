@@ -221,30 +221,37 @@ class ActivityObserver(BaseObserver):
             self._last_activity["t"] = time.monotonic()
 
 
-# Marks an LLMContextFrame exception as unrecoverable within the SAME turn: the model's
-# own tool-call generation was malformed, not a transient network/quota condition — a real
-# call died in ~40s of total silence this way (the model produced invalid JSON for
-# submit_answer's arguments on a fragmented, hard-to-transcribe spoken answer). Unlike a
-# provider rate_limit — which the SDK already retries and which this codebase has observed
-# resolve within the same turn — this exact failure never resolves itself, since nothing
-# retries or regenerates the malformed completion; the pipeline just goes silent forever
-# waiting for a turn that already died. Matched by message substring, not ErrorCategory,
-# since pipecat's own classifier has no provider-specific case for it and falls back to
-# UNKNOWN — indistinguishable there from other benign-but-unclassified conditions.
-_DEAD_TURN_ERROR_MARKER = "Failed to parse"
+# Marks an LLMContextFrame exception as unrecoverable within the SAME turn: whatever the
+# model or SDK did, this specific completion attempt is over and nothing else will finish
+# it — the pipeline would otherwise go silent forever waiting for a turn that already
+# died. Confirmed live TWICE, with TWO DIFFERENT underlying failures: gpt-oss producing
+# malformed tool-call JSON on a fragmented answer ("Failed to parse tool call arguments as
+# JSON"), and qwen — the documented, otherwise-reliable model — separately failing to
+# produce a usable function call on a perfectly clean answer ("Failed to call a function.
+# Please adjust your prompt..."). The first fix here matched only the first message
+# verbatim and completely missed the second, real incident that followed, so the caller
+# was left silent again. Matching the fixed prefix pipecat's own base_llm.py always uses
+# for a non-timeout completion exception ("Error during completion:" — read directly in
+# the installed package, the ONLY other completion-failure path there is a distinctly
+# worded "LLM completion timeout") is robust against any future wording Groq/openai
+# produces, since it's OUR code's own wrapping text, not the provider's. Both messages are
+# matched, not just one, structurally covering every way this exact code path can fail to
+# finish a turn — not another specific string to fall behind on the next new incident.
+_DEAD_TURN_ERROR_MARKERS = ("Error during completion:", "LLM completion timeout")
 
 
 class DeadTurnRecoveryObserver(BaseObserver):
-    """When the LLM's own completion throws instead of finishing a turn — confirmed
-    live: a malformed tool-call JSON parse failure from gpt-oss on a fragmented spoken
-    answer — speaks a short recovery line directly via TTSSpeakFrame
-    (bypassing the LLM entirely, since asking a model that just failed a basic
-    generation to immediately generate again is asking for a repeat) so the caller hears
-    SOMETHING instead of dead air. append_to_context=True gives the model continuity for
-    the next real turn. Debounced to one recovery line per 10s so a burst of the same
-    failure can't chatter."""
+    """When the LLM's own completion throws instead of finishing a turn, speaks a short
+    recovery line directly via TTSSpeakFrame (bypassing the LLM entirely, since asking a
+    model that just failed a basic generation to immediately generate again is asking for
+    a repeat) so the caller hears SOMETHING instead of dead air. append_to_context=True
+    gives the model continuity for the next real turn. Debounced to one recovery line per
+    3s — short enough that two genuinely separate failed turns (confirmed live: a caller
+    repeating an unanswered question 9s after the first failure, triggering a second,
+    independent one) each still get a response, long enough to absorb a single exception
+    somehow reaching this observer more than once."""
 
-    _COOLDOWN_S = 10.0
+    _COOLDOWN_S = 3.0
 
     def __init__(self, task: PipelineTask) -> None:
         super().__init__()
@@ -255,7 +262,8 @@ class DeadTurnRecoveryObserver(BaseObserver):
         frame = data.frame
         if not isinstance(frame, ErrorFrame):
             return
-        if _DEAD_TURN_ERROR_MARKER not in (frame.error or ""):
+        error_text = frame.error or ""
+        if not any(marker in error_text for marker in _DEAD_TURN_ERROR_MARKERS):
             return
         now = time.monotonic()
         if now - self._last_fired < self._COOLDOWN_S:
