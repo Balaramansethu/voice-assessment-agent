@@ -28,7 +28,8 @@ from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.frames.frames import (
-    Frame, LLMRunFrame, TextFrame, UserStoppedSpeakingFrame, TTSStartedFrame,
+    ErrorFrame, Frame, LLMRunFrame, TextFrame, TTSSpeakFrame,
+    UserStoppedSpeakingFrame, TTSStartedFrame,
 )
 from pipecat.observers.base_observer import BaseObserver, FramePushed
 from pipecat.observers.user_bot_latency_observer import UserBotLatencyObserver
@@ -218,6 +219,52 @@ class ActivityObserver(BaseObserver):
     async def on_push_frame(self, data: FramePushed) -> None:
         if isinstance(data.frame, (UserStoppedSpeakingFrame, TTSStartedFrame)):
             self._last_activity["t"] = time.monotonic()
+
+
+# Marks an LLMContextFrame exception as unrecoverable within the SAME turn: the model's
+# own tool-call generation was malformed, not a transient network/quota condition — a real
+# call died in ~40s of total silence this way (the model produced invalid JSON for
+# submit_answer's arguments on a fragmented, hard-to-transcribe spoken answer). Unlike a
+# provider rate_limit — which the SDK already retries and which this codebase has observed
+# resolve within the same turn — this exact failure never resolves itself, since nothing
+# retries or regenerates the malformed completion; the pipeline just goes silent forever
+# waiting for a turn that already died. Matched by message substring, not ErrorCategory,
+# since pipecat's own classifier has no provider-specific case for it and falls back to
+# UNKNOWN — indistinguishable there from other benign-but-unclassified conditions.
+_DEAD_TURN_ERROR_MARKER = "Failed to parse"
+
+
+class DeadTurnRecoveryObserver(BaseObserver):
+    """When the LLM's own completion throws instead of finishing a turn — confirmed
+    live: a malformed tool-call JSON parse failure from gpt-oss on a fragmented spoken
+    answer — speaks a short recovery line directly via TTSSpeakFrame
+    (bypassing the LLM entirely, since asking a model that just failed a basic
+    generation to immediately generate again is asking for a repeat) so the caller hears
+    SOMETHING instead of dead air. append_to_context=True gives the model continuity for
+    the next real turn. Debounced to one recovery line per 10s so a burst of the same
+    failure can't chatter."""
+
+    _COOLDOWN_S = 10.0
+
+    def __init__(self, task: PipelineTask) -> None:
+        super().__init__()
+        self._task = task
+        self._last_fired = 0.0
+
+    async def on_push_frame(self, data: FramePushed) -> None:
+        frame = data.frame
+        if not isinstance(frame, ErrorFrame):
+            return
+        if _DEAD_TURN_ERROR_MARKER not in (frame.error or ""):
+            return
+        now = time.monotonic()
+        if now - self._last_fired < self._COOLDOWN_S:
+            return
+        self._last_fired = now
+        await self._task.queue_frames([
+            TTSSpeakFrame(text="Sorry, I didn't quite catch that — could you say that again?",
+                         append_to_context=True),
+        ])
 
 
 def _transport_params() -> dict:
@@ -527,6 +574,9 @@ async def build_interview_task(
     # PR-408: wire Pipecat's built-in latency observers for STT/LLM/TTS metrics.
     task.add_observer(UserBotLatencyObserver())
     task.add_observer(MetricsLogObserver())
+    # A malformed LLM completion (bad tool-call JSON) otherwise leaves the caller in
+    # total silence with no recovery — confirmed live on a real call.
+    task.add_observer(DeadTurnRecoveryObserver(task))
 
     async def greet(*, provider_call_id: str, from_number: str, transport_kind: str) -> None:
         info = await tools.open_inbound(provider_call_id=provider_call_id,
