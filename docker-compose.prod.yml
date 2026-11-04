@@ -39,6 +39,7 @@ services:
     env_file: .env
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      APP_ENV: production
     command: ["python3", "-m", "app.worker.grading_worker"]
     depends_on:
       postgres:
@@ -52,6 +53,7 @@ services:
     env_file: .env
     environment:
       API_BASE: http://api:8000
+      APP_ENV: production
     # Twilio telephony mode; -x is the public host used to build the WSS stream URL.
     # The public webhook is guarded by Twilio signature validation (api service),
     # which is the primary access control for the phone path.
