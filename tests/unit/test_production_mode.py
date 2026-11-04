@@ -278,6 +278,47 @@ def test_app_startup_succeeds_with_valid_production_config(monkeypatch):
 _COMPOSE_PROD_PATH = pathlib.Path(__file__).resolve().parents[2] / "docker-compose.prod.yml"
 
 
+def _leading_spaces(line):
+    return len(line) - len(line.lstrip(" "))
+
+
+def _compose_prod_service_environment(service_name):
+    lines = _COMPOSE_PROD_PATH.read_text().splitlines()
+    service_header = f"  {service_name}:"
+
+    for start, line in enumerate(lines):
+        if line == service_header:
+            break
+    else:
+        pytest.fail(f"{service_name} service is missing from docker-compose.prod.yml")
+
+    service_indent = _leading_spaces(lines[start])
+    service_lines = []
+    for line in lines[start + 1:]:
+        if line.strip() and _leading_spaces(line) <= service_indent:
+            break
+        service_lines.append(line)
+
+    environment = {}
+    environment_indent = None
+    for line in service_lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = _leading_spaces(line)
+        if environment_indent is None:
+            if stripped == "environment:":
+                environment_indent = indent
+            continue
+        if indent <= environment_indent:
+            break
+        key, separator, value = stripped.partition(":")
+        if separator:
+            environment[key.strip()] = value.strip().strip("'\"")
+
+    return environment
+
+
 def test_compose_prod_does_not_hardcode_dev_db_credentials():
     text = _COMPOSE_PROD_PATH.read_text()
     assert "postgresql+psycopg://interview:interview@" not in text
@@ -293,6 +334,7 @@ def test_compose_prod_sources_db_credentials_from_env():
     assert "POSTGRES_DB: ${POSTGRES_DB}" in text
 
 
-def test_compose_prod_sets_app_env_production():
-    text = _COMPOSE_PROD_PATH.read_text()
-    assert "APP_ENV: production" in text
+@pytest.mark.parametrize("service_name", ["api", "worker", "agent"])
+def test_compose_prod_sets_app_env_production(service_name):
+    environment = _compose_prod_service_environment(service_name)
+    assert environment.get("APP_ENV") == "production"
