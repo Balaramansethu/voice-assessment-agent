@@ -37,12 +37,23 @@ async def _post(path: str, json: dict, timeout: float, retries: int = 1) -> dict
             if r.status_code >= 400:
                 logger.warning("tool call %s -> HTTP %s", path, r.status_code)
                 return {"ok": False, "error": f"http_{r.status_code}"}
-            return r.json()
-        except (httpx.ConnectError, httpx.TimeoutException) as exc:
+            try:
+                return r.json()
+            except ValueError:
+                logger.warning("tool call %s returned invalid JSON", path)
+                return {"ok": False, "error": "invalid_json"}
+        except httpx.HTTPError as exc:
+            # Broadly treat any httpx transport/client error as retryable in the
+            # same way ConnectError and TimeoutException were previously handled.
             last_exc = exc
             if attempt < retries:
                 await asyncio.sleep(0.5 * (attempt + 1))
                 continue
+        except Exception as exc:
+            # Safety net: do not let unexpected exceptions propagate out of the
+            # tool helper. Log and return a provider_error to the caller.
+            logger.exception("unexpected error in tool call %s: %s", path, exc)
+            return {"ok": False, "error": "provider_error"}
     logger.warning("tool call %s failed after retries: %s", path, last_exc)
     return {"ok": False, "error": "provider_unreachable"}
 
