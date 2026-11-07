@@ -40,6 +40,7 @@ These services receive PII in the course of normal operation:
      - ON in development: full payloads including transcripts, candidate names, answers, rubrics
      - ON in production only if explicitly enabled: same full payloads sent to LangSmith cloud
      - OFF in production by default: PII/content fields are redacted; only step names, latencies, status codes logged
+   - Groq/OpenAI wrapper behavior: when content capture is OFF, `app/observability/tracing.py::groq_client()` injects `_redact_for_trace` into LangSmith's `wrap_openai` via `process_inputs`/`process_outputs` when that wrapper supports callbacks. If the installed LangSmith wrapper does not accept those callbacks, the Groq client is left unwrapped rather than risking raw message capture.
    - Redacted fields (always stripped in production, unless `langsmith_capture_content=true`): `transcript`, `candidate_name`, `phone`, `email`, `answer`, `reason`, `rationale`, and resume/rubric text (see `app/observability/tracing.py::_REDACT_KEYS`)
    - Retention: per LangSmith ToS (typically 30 days; user can configure)
 
@@ -91,7 +92,7 @@ If these capabilities are added in the future, the following FK cleanup order MU
 
 The following controls reduce PII exposure risk:
 
-- **Transcripts in logs/traces**: suppressed by default in production (`langsmith_capture_content=false`), redacted via `_REDACT_KEYS` in `tracing.py`
+- **Transcripts in logs/traces**: suppressed by default in production (`langsmith_capture_content=false`), redacted via `_REDACT_KEYS` and `_redact_for_trace` in `app/observability/tracing.py`; LangSmith Groq/OpenAI wrapping uses those redaction callbacks when supported and falls back to no wrapper when callback support is absent
 - **Passwords/secrets**: never logged; `settings` and credentials are not printed or captured in traces
 - **Phone numbers**: indexed and logged only for identity verification (call ingestion), never in response bodies to the agent
 - **One-time voice tokens**: 30-second TTL, cryptographically random, single-use, consumed at WebSocket auth time
