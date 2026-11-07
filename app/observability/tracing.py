@@ -11,6 +11,7 @@ so token usage, latency, model, and errors are captured automatically.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import os
 import re
 
@@ -85,6 +86,28 @@ def _redact_for_trace(payload):
         return payload
     return _redact_value(payload)
 
+
+def _wrap_openai_accepts_redaction_callbacks(wrap_openai):
+    """Return true only when redaction callbacks are explicit parameters.
+
+    A **kwargs sink can accept and ignore unknown callback names, which would
+    still allow the wrapper to capture raw LLM payloads before redaction.
+    """
+    try:
+        signature = inspect.signature(wrap_openai)
+    except (TypeError, ValueError):
+        return False
+
+    accepts = {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    }
+    return {"process_inputs", "process_outputs"} <= accepts
+
 if TRACING_ENABLED:
     # LangSmith SDK reads these env vars. Set them before anything traced runs.
     os.environ["LANGSMITH_TRACING"] = "true"
@@ -155,7 +178,14 @@ def groq_client():
                 # warning from its _openai_agents submodule (which we don't use).
                 warnings.simplefilter("ignore", DeprecationWarning)
                 from langsmith.wrappers import wrap_openai
-            client = wrap_openai(client)
+            if CONTENT_CAPTURE_ENABLED:
+                client = wrap_openai(client)
+            elif _wrap_openai_accepts_redaction_callbacks(wrap_openai):
+                client = wrap_openai(
+                    client,
+                    process_inputs=_redact_for_trace,
+                    process_outputs=_redact_for_trace,
+                )
         except Exception:
             pass
     _groq_singleton = client
