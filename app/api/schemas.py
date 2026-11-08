@@ -3,9 +3,19 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, StringConstraints, field_validator
 
 from app.domain.states import CallStatus, Intent
+
+
+TERMINAL_STATUSES = frozenset([
+    CallStatus.DISCONNECTED,
+    CallStatus.COMPLETED,
+    CallStatus.FAILED,
+    CallStatus.ABANDONED,
+    CallStatus.NO_ANSWER,
+    CallStatus.VOICEMAIL,
+])
 
 
 def bounded_str(max_length: int, *, min_length: int = 1, strip: bool = True) -> type:
@@ -61,6 +71,21 @@ class InboundCallRequest(BaseModel):
 
 class EndCallRequest(BaseModel):
     status: CallStatus = CallStatus.DISCONNECTED
+
+    @field_validator("status", mode="before")
+    @classmethod
+    def status_must_be_terminal(cls, value: object) -> object:
+        try:
+            status = value if isinstance(value, CallStatus) else CallStatus(value)
+        except ValueError:
+            return value
+
+        if status not in TERMINAL_STATUSES:
+            raise ValueError(
+                "End call status must be terminal; rejected non-terminal statuses include "
+                "INITIATED, RINGING, ANSWERED, ACTIVE"
+            )
+        return value
 
 
 class ConsumeSessionRequest(BaseModel):

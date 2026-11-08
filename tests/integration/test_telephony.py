@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import func, select, text, update
 
 import app.main as main_module
+from app.api.schemas import TERMINAL_STATUSES
 from app.config import settings
 from app.db.models import Call, VoiceSessionToken
 from app.db.session import SessionLocal, init_db
@@ -486,26 +487,104 @@ def test_same_callsid_concurrent_retry_never_500s(monkeypatch):
     _expire_tokens_for_callsid(_session(), same_sid)
 
 
-def test_end_call_stamps_terminal_status_and_timestamp():
+@pytest.mark.parametrize(
+    "terminal_status",
+    sorted(status.value for status in TERMINAL_STATUSES),
+)
+def test_end_call_accepts_terminal_status(terminal_status):
     s = _session()
-    call = Call(direction="INBOUND", status="ACTIVE", provider_call_id=f"CAEND1{_RUN_ID}", transport="twilio")
+    call = Call(
+        direction="INBOUND",
+        status="ACTIVE",
+        provider_call_id=f"CAENDTERM{terminal_status.replace('_', '')}{_RUN_ID}",
+        transport="twilio",
+    )
     s.add(call); s.commit()
-    resp = client.post(f"/calls/{call.id}/end", json={"status": "COMPLETED"}, headers=_AGENT_HEADERS)
+    call_id = call.id
+    s.close()
+
+    resp = client.post(
+        f"/calls/{call_id}/end",
+        json={"status": terminal_status},
+        headers=_AGENT_HEADERS,
+    )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["status"] == "COMPLETED"
+    assert body["status"] == terminal_status
     assert body["ended_at"] is not None
+
+    s2 = _session()
+    try:
+        refreshed = s2.get(Call, call_id)
+        assert refreshed.status == terminal_status
+        assert refreshed.ended_at is not None
+    finally:
+        s2.close()
+
+
+@pytest.mark.parametrize("status", ["INITIATED", "RINGING", "ANSWERED", "ACTIVE"])
+def test_end_call_rejects_non_terminal_status_before_mutation(status):
+    s = _session()
+    call = Call(
+        direction="INBOUND",
+        status="ACTIVE",
+        provider_call_id=f"CAENDNONTERM{status}{_RUN_ID}",
+        transport="twilio",
+    )
+    s.add(call); s.commit()
+    call_id = call.id
+    before_status = call.status
+    before_ended_at = call.ended_at
+
+    try:
+        resp = client.post(f"/calls/{call_id}/end", json={"status": status}, headers=_AGENT_HEADERS)
+        assert resp.status_code == 422
+        assert resp.json()["detail"]
+
+        s2 = _session()
+        try:
+            refreshed = s2.get(Call, call_id)
+            assert refreshed.status == before_status
+            assert refreshed.ended_at == before_ended_at
+        finally:
+            s2.close()
+    finally:
+        cleanup = _session()
+        try:
+            cleanup_call = cleanup.get(Call, call_id)
+            if cleanup_call is not None and cleanup_call.ended_at is None:
+                cs.end_call(cleanup, cleanup_call, CallStatus.COMPLETED)
+                cleanup.commit()
+        finally:
+            cleanup.close()
 
 
 def test_end_call_is_idempotent_sequential():
     s = _session()
     call = Call(direction="INBOUND", status="ACTIVE", provider_call_id=f"CAEND2{_RUN_ID}", transport="twilio")
     s.add(call); s.commit()
-    r1 = client.post(f"/calls/{call.id}/end", json={"status": "DISCONNECTED"}, headers=_AGENT_HEADERS)
-    first_ended_at = r1.json()["ended_at"]
-    r2 = client.post(f"/calls/{call.id}/end", json={"status": "FAILED"}, headers=_AGENT_HEADERS)
-    assert r2.json()["ended_at"] == first_ended_at
-    assert r2.json()["status"] == "DISCONNECTED"
+    call_id = call.id
+    s.close()
+
+    r1 = client.post(f"/calls/{call_id}/end", json={"status": "DISCONNECTED"}, headers=_AGENT_HEADERS)
+    assert r1.status_code == 200
+    first = r1.json()
+    assert first["status"] == "DISCONNECTED"
+    assert first["ended_at"] is not None
+
+    r2 = client.post(f"/calls/{call_id}/end", json={"status": "FAILED"}, headers=_AGENT_HEADERS)
+    assert r2.status_code == 200
+    second = r2.json()
+    assert second["ended_at"] == first["ended_at"]
+    assert second["status"] == first["status"]
+
+    s2 = _session()
+    try:
+        refreshed = s2.get(Call, call_id)
+        assert refreshed.status == first["status"]
+        assert refreshed.ended_at == datetime.fromisoformat(first["ended_at"])
+    finally:
+        s2.close()
 
 
 def test_end_call_concurrent_race_exactly_one_consistent_terminal_state():
