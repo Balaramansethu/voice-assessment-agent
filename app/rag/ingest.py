@@ -91,7 +91,7 @@ def ingest_file(session: Session, path: Path, *, reindex: bool = False) -> dict:
     raw = path.read_text()
     meta, body = parse_frontmatter(raw)
     uri = str(path)
-    checksum = _checksum(body)
+    checksum = _checksum(raw)
     embedder = get_embedder()
 
     if meta.get("type") == "candidate":
@@ -106,7 +106,8 @@ def ingest_file(session: Session, path: Path, *, reindex: bool = False) -> dict:
         session.execute(delete(KBChunk).where(KBChunk.source_id == existing.id))
         existing.checksum = checksum
         existing.version += 1
-        existing.title = meta.get("title", existing.title)
+        existing.type = meta.get("type", "company")
+        existing.title = meta.get("title", path.stem)
         existing.visibility = meta.get("visibility", "candidate")
         existing.role = meta.get("role") or None
         source = existing
